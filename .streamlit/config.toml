@@ -1,0 +1,20 @@
+# Visual theme for the Blueprint UI. Deliberately not Streamlit's
+# default red-accented look -- a calmer, product-grade palette
+# appropriate for a tool that's demoed to non-engineering stakeholders.
+
+[theme]
+base = "light"
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F6FB"
+textColor = "#1B1F2A"
+borderColor = "#E4E7F1"
+linkColor = "#4F46E5"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+baseRadius = "0.75rem"
+buttonRadius = "0.6rem"
+showWidgetBorder = true
+
+[client]
+toolbarMode = "minimal"
