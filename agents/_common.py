@@ -1,4 +1,10 @@
-"""Shared helpers for architecture-level agents."""
+"""Shared helpers for architecture-level agents.
+
+Plain words: small utilities every agent uses - loading its instruction
+sheet, formatting earlier results into text for the AI to read, adding
+reviewer feedback to the prompt, and tidying the optional "clarifying
+questions" the AI may raise.
+"""
 
 import json
 import re
@@ -13,6 +19,8 @@ def load_skill(name: str) -> str:
     """Read a skill file once per process; skills are static within a
     run. name is the skill's filename without extension, e.g.
     'architecture' for skills/architecture.md."""
+    # @lru_cache (above) remembers the result, so the file is read from
+    # disk only the first time.
     path = config.SKILLS_DIR / f"{name}.md"
     if not path.is_file():
         raise FileNotFoundError(f"Skill file not found: {path}")
@@ -33,8 +41,11 @@ def format_dict(data: Dict[str, Any]) -> str:
     scope, etc.); forwarding the raw question+options alongside that
     would hand the next agent unresolved ambiguity to guess at, or a
     stale menu of options a human already decided on."""
+    # Empty input -> just print it as empty JSON.
     if not data:
         return json.dumps(data or {}, indent=2, default=str)
+    # Copy everything except the "clarifying_questions" field, then print
+    # it as neatly indented JSON text.
     cleaned = {k: v for k, v in data.items() if k != "clarifying_questions"}
     return json.dumps(cleaned, indent=2, default=str)
 
@@ -46,15 +57,18 @@ def format_feedback_section(
     (recalled past runs, standing human decisions -- see hive/); it is
     appended after any revision feedback and is empty for a run with
     nothing to recall, so behavior is unchanged in that case."""
+    # No feedback to give -> only return the background notes (maybe empty).
     if not revision_feedback:
         return context_notes
+    # Otherwise build a block of text telling the AI "your last attempt
+    # was reviewed; here is what was wrong, please fix it".
     return f"""
 ============================================================
-PRIOR REVIEW FEEDBACK (revision pass -- address this)
+PRIOR FEEDBACK (revision pass -- address this)
 ============================================================
 
-The previous version of this plan was reviewed and found to have
-issues. Address them; do not just resubmit the same output. If this
+The previous version of this plan received feedback from a human
+reviewer. Address it; do not just resubmit the same output. If this
 part of the plan was actually correct and the issue lies elsewhere,
 say so plainly rather than changing something that wasn't wrong.
 
@@ -67,6 +81,7 @@ again -- a resolved ambiguity is not a genuine one anymore.
 {context_notes}"""
 
 
+# At most this many questions per stage are kept (don't overwhelm reviewers).
 MAX_CLARIFYING_QUESTIONS = 2
 
 # Enforced by validate_clarifying_questions (and stated in every skill's
@@ -79,15 +94,20 @@ MAX_OPTION_CHARS = 120
 def _shorten(text: str, limit: int) -> str:
     """Keeps whole sentences up to `limit` chars; a single over-long
     sentence is hard-cut with an ellipsis."""
+    # Collapse any messy spacing/newlines into single spaces.
     text = " ".join(text.split())
+    # Already short enough -> leave untouched.
     if len(text) <= limit:
         return text
+    # Otherwise add whole sentences one by one until the next would
+    # exceed the limit.
     kept = ""
     for sentence in re.split(r"(?<=[.?!])\s+", text):
         candidate = f"{kept} {sentence}".strip()
         if len(candidate) > limit:
             break
         kept = candidate
+    # If even the first sentence is too long, cut it and add "...".
     return kept or text[: limit - 1].rstrip() + "…"
 
 
@@ -103,6 +123,7 @@ def validate_clarifying_questions(result: Dict[str, Any], agent_name: str) -> No
     its own recommendation instead of repeating an option's exact
     text, which used to hard-crash the run right here). Mutates
     result["clarifying_questions"] in place."""
+    # If the AI gave no list at all, store an empty list and finish.
     questions = result.get("clarifying_questions")
     if not isinstance(questions, list):
         result["clarifying_questions"] = []
@@ -110,13 +131,17 @@ def validate_clarifying_questions(result: Dict[str, Any], agent_name: str) -> No
 
     cleaned: List[Dict[str, Any]] = []
     for q in questions:
+        # Skip anything that isn't a proper question entry.
         if not isinstance(q, dict):
             continue
         question_text = q.get("question")
         options = q.get("options")
+        # A usable question needs text and at least 2 options to choose from.
         if not question_text or not isinstance(options, list) or len(options) < 2:
             continue
 
+        # The "recommended" answer must be one of the listed options;
+        # otherwise ignore it.
         recommended = q.get("recommended_option")
         if recommended not in options:
             recommended = None
@@ -127,6 +152,7 @@ def validate_clarifying_questions(result: Dict[str, Any], agent_name: str) -> No
         if recommended is not None:
             recommended = shortened[options.index(recommended)]
 
+        # Keep the tidied-up version of this question.
         cleaned.append(
             {
                 "question": _shorten(str(question_text), MAX_QUESTION_CHARS),
@@ -147,6 +173,8 @@ def validate_clarifying_questions(result: Dict[str, Any], agent_name: str) -> No
 # skill files themselves are plain static markdown and this constant
 # is not (and cannot be) programmatically injected into them. When
 # editing this, edit the matching prose in every skill file to match.
+# (Plain words: this text is the rulebook about when an agent may ask a
+# human a question. It is shown to the AI, not run as code.)
 CLARIFYING_QUESTIONS_RULE = """
 - This system's plans are reviewed by CXO-level stakeholders, not
   engineers -- `clarifying_questions` is for genuine, material

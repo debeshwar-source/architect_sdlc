@@ -1,0 +1,4 @@
+# Extra packages for the desktop app (see README, "Desktop app").
+# Install on top of requirements.txt:  pip install -r requirements.txt -r requirements-desktop.txt
+pywebview       # the native window that shows the app
+pyinstaller     # builds the double-clickable app (only needed to build, not to run)

@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 runs/
 memory/
+.env
+.venv-desktop/
+build/
+dist/
+desktop.log

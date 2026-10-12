@@ -18,3 +18,13 @@ showWidgetBorder = true
 
 [client]
 toolbarMode = "minimal"
+
+[server]
+# Only this computer can reach the app. (Streamlit's default is to listen on every
+# network interface, which would expose the app -- and the Jira/Claude access behind
+# it -- to anyone on the same network.)
+address = "127.0.0.1"
+
+[browser]
+# Do not send anonymous usage statistics.
+gatherUsageStats = false
