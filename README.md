@@ -258,18 +258,42 @@ Set `CLAUDE_SDLC_ARCHITECT_MODEL_ID` to use a different Claude model
 Blueprint can run in its own window instead of a browser tab. It is the same app:
 a small Streamlit server starts in the background and the window shows it.
 
-**Run it from a checkout**
+**Quick start (Mac or Linux, Python 3.10 or newer)**
 
 ```bash
-pip install -r requirements.txt -r requirements-desktop.txt
-python3 desktop.py
+git clone https://github.com/debeshwar-source/architect_sdlc.git
+cd architect_sdlc
+./run_desktop.sh
 ```
 
-(Without `pywebview` installed it opens your normal browser instead.)
+That is all. The first run creates a private environment in `.venv-desktop` and
+installs what the app needs (a few minutes, needs internet); after that it just starts.
+Closing the window stops the app.
+
+Before the agents can work you need to sign in to Claude, in one of two ways:
+- install Claude Code and run `claude login` once, or
+- put `ANTHROPIC_API_KEY=your-key` in a file named `.env` in the project folder.
+
+For Jira, copy `.env.example` to `.env` and fill it in (see "Creating the tickets in a
+real Jira" above). `.env` is never committed.
+
+If you would rather manage the environment yourself:
+
+```bash
+python3 -m venv .venv-desktop
+.venv-desktop/bin/pip install -r requirements.txt -r requirements-desktop.txt
+.venv-desktop/bin/python desktop.py
+```
+
+(Without `pywebview` installed it opens your normal browser instead.) On Windows the
+equivalent is `py -m venv .venv-desktop`, then `.venv-desktop\Scripts\pip install -r
+requirements.txt -r requirements-desktop.txt`, then `.venv-desktop\Scripts\python
+desktop.py` -- this is untested; the Mac route is the one that has been tried.
 
 **Build a double-clickable app**
 
 ```bash
+.venv-desktop/bin/pip install -r requirements-build.txt   # once: adds the packager
 ./packaging/build_desktop.sh        # about a minute; creates dist/Blueprint.app
 open dist/Blueprint.app             # or drag it to Applications
 ```
@@ -354,5 +378,7 @@ orchestrator/graph.py           LangGraph wiring
 cli.py, streamlit_app.py        entry points
 desktop.py                      runs the app in its own window (see Desktop app)
 packaging/build_desktop.sh      builds dist/Blueprint.app
-requirements-desktop.txt        extra packages for the desktop app
+run_desktop.sh                  one command: sets up and runs the desktop app
+requirements-desktop.txt        extra package for the desktop window (pywebview)
+requirements-build.txt          adds PyInstaller, only needed to build the app
 ```

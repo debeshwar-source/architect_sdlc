@@ -1,0 +1,5 @@
+# Everything needed to BUILD the double-clickable app (packaging/build_desktop.sh).
+# You do not need this just to run the app.
+-r requirements.txt
+-r requirements-desktop.txt
+pyinstaller     # packages Python + the app into dist/Blueprint.app

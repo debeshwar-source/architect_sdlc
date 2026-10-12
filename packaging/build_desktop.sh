@@ -3,7 +3,7 @@
 #
 #   ./packaging/build_desktop.sh            build, then self-test the result
 #
-# Needs the packages in requirements.txt and requirements-desktop.txt. If a
+# Needs the packages in requirements-build.txt. If a
 # virtual environment exists at .venv-desktop it is used, otherwise python3 is.
 # The build bundles Python, Streamlit, the pipeline and the Claude Code CLI that
 # ships with claude-agent-sdk, so expect a large app (several hundred MB).
@@ -12,6 +12,11 @@ cd "$(dirname "$0")/.."
 
 PY=python3
 [ -x .venv-desktop/bin/python ] && PY=.venv-desktop/bin/python
+
+if ! "$PY" -c "import PyInstaller" 2>/dev/null; then
+  echo "PyInstaller is not installed. Run:  $PY -m pip install -r requirements-build.txt" >&2
+  exit 1
+fi
 
 "$PY" -m PyInstaller --noconfirm --clean --windowed --name Blueprint \
   --specpath build/spec \
