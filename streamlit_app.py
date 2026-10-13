@@ -101,8 +101,7 @@ st.markdown(
 )
 
 # ---- Page header ----
-st.markdown('<p class="app-eyebrow">Claude SDLC</p>', unsafe_allow_html=True)
-st.title("Blueprint")
+st.title("From requirement to rollout")
 st.markdown(
     "Turn one requirement into a design and a ready-to-file Jira backlog — "
     "epic, stories, tasks and subtasks — reasoned end-to-end by Claude. "
@@ -177,6 +176,7 @@ with st.container(border=True):
         mode = st.radio(
             "Mode",
             ["Agentic", "Human approval"],
+            index=1,
             horizontal=True,
             captions=[
                 "Runs start to finish, unattended.",
