@@ -2,7 +2,7 @@
 SDLC planning pipeline, wired as a LangGraph state machine.
 
     requirement -> design -> [change required?]
-                                |-> release_planning -> release_apply -> jira_publish -> kb_save -> finalize
+                                |-> quality_planning -> release_planning (Engineering Manager) -> release_apply -> jira_publish -> kb_save -> confluence_publish -> finalize
                                 '-> finalize (design concluded nothing needs to change)
 
 The user may also choose WHICH agents run: start with the Requirement agent or
@@ -11,6 +11,9 @@ as written), and stop after the Requirement agent, the Design agent, or carry on
 through release. Between the two agents they can add binding architectural
 direction for the Design agent. See `start_at`, `stop_after` and
 `architecture_direction` in the state below.
+
+confluence_publish (the last step) offers to publish the design as a Confluence page,
+with its diagrams, after the person has had a chance to reword it.
 
 release_apply writes the local files (mock Jira + knowledge-base updates).
 jira_publish then creates the tickets in the REAL Jira, but only if Jira is
@@ -50,11 +53,14 @@ from typing import Any, Callable, Dict, List, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 import agents.design as design_agent
+import agents.quality as quality_agent
 import agents.release as release_agent
 import agents.requirement as requirement_agent
 import config
 import knowledge_base.loader as kb_loader
 import tools.issue_tracker as issue_tracker
+import tools.confluence_client as confluence_client
+import tools.design_doc as design_doc
 import tools.jira_client as jira_client
 from hive import blackboard, events, memory
 from knowledge_base.loader import ApplicationDoc
@@ -101,6 +107,7 @@ class SDLCState(TypedDict, total=False):
     requirement: dict
     design: dict
     change_required: bool                # does the design need any change at all?
+    quality_plan: dict                   # the test plan: plain-English test cases (shown / saved as Excel)
     release_plan: dict                   # epic, stories/tasks/subtasks, rollout
     release_result: dict                 # the Jira files written (mock Jira)
     kb_result: dict                      # what kb_save did (status, target, per-document results)
@@ -135,6 +142,18 @@ class SDLCState(TypedDict, total=False):
     jira_selection: Any
     jira_confirm: Callable[[dict], bool]
     jira_result: dict
+
+    # The design document (diagrams + text) and publishing it to Confluence:
+    #   design_doc_edits     the user's WORDING changes to the document: {"where": "new text"} (see
+    #                        tools/design_doc.py). The design itself is never altered by these.
+    #   confluence_approved  True / False once a human has decided; None = not asked yet
+    #   confluence_confirm   optional function(preview) -> bool the pipeline calls to ASK (the CLI
+    #                        supplies one; the web UI asks on screen and sets confluence_approved)
+    #   confluence_result    what happened: status published / declined / skipped / failed
+    design_doc_edits: dict
+    confluence_approved: Any
+    confluence_confirm: Callable[[dict], bool]
+    confluence_result: dict
 
     # Set by the Streamlit UI's human-in-the-loop mode when a reviewer
     # asks a stage to revise its own last output, e.g.
@@ -193,7 +212,7 @@ def new_run_id() -> str:
 
 # Most stages store their output under a key equal to the stage name; this
 # lists the exceptions: the release_planning stage stores "release_plan".
-_RESULT_KEY = {"release_planning": "release_plan"}
+_RESULT_KEY = {"release_planning": "release_plan", "quality_planning": "quality_plan"}
 
 
 def _context_for(stage: str, state: SDLCState) -> str:
@@ -243,6 +262,9 @@ def _summarize(stage: str, result: dict) -> str:
             f"change_required={out.get('change_required')}; affected: {', '.join(names) or 'none'}; "
             f"new: {', '.join(new) or 'none'}; kb updates: {len(out.get('knowledge_base_updates', []))}"
         )
+    if stage == "quality_planning":
+        cases = out.get("test_cases", [])
+        return f"{len(cases)} test case(s)"
     if stage == "release_planning":
         stories = out.get("stories", [])
         tasks = sum(len(s.get("tasks", [])) for s in stories)
@@ -250,6 +272,9 @@ def _summarize(stage: str, result: dict) -> str:
     if stage == "release_apply":
         counts = (result.get("release_result") or {}).get("counts", {})
         return ", ".join(f"{n} {k}" for k, n in counts.items())
+    if stage == "confluence_publish":
+        cf = result.get("confluence_result") or {}
+        return f"{cf.get('status')}: {cf.get('url') or cf.get('reason') or cf.get('error', '')}"
     if stage == "kb_save":
         kb = result.get("kb_result") or {}
         return f"{kb.get('status')}: {kb.get('kb_name') or kb.get('reason') or kb.get('error', '')}"
@@ -289,6 +314,9 @@ def _post_stage_output(run_id: str, stage: str, result: dict, iteration: int) ->
                 run_id, "risks", stage,
                 risk if isinstance(risk, str) else json.dumps(risk, default=str), iteration,
             )
+
+    elif stage == "quality_planning":
+        blackboard.post(run_id, "decisions", stage, f"{len(out.get('test_cases', []))} test case(s) planned", iteration)
 
     # Any question the stage wants a human to answer goes on the board too.
     for q in out.get("clarifying_questions", []):
@@ -429,7 +457,8 @@ def design_node(state: SDLCState):
         "iteration": iteration,
         # A fresh design supersedes every downstream artifact - without
         # clearing these, a revised design (e.g. one that now decides no
-        # change is needed) would leave a stale release plan in state.
+        # change is needed) would leave a stale test or release plan in state.
+        "quality_plan": {},
         "release_plan": {},
         "release_result": {},
         "kb_result": {},
@@ -438,6 +467,10 @@ def design_node(state: SDLCState):
         "jira_approved": None,
         "jira_selection": None,
         "jira_result": {},
+        # Wording edits point at parts of the OLD design; a new design starts clean.
+        "design_doc_edits": {},
+        "confluence_approved": None,
+        "confluence_result": {},
         "history": append_history(
             state,
             {
@@ -446,6 +479,23 @@ def design_node(state: SDLCState):
                 "iteration": iteration,
                 "result": design,
             },
+        ),
+    }
+
+
+@_hive("quality_planning")
+def quality_planning_node(state: SDLCState):
+    # STEP 2b: plan how the solution will be tested - plain-English test cases.
+    revision_feedback = _revision_feedback_for("quality_planning", state)
+    quality_plan = quality_agent.run(
+        state["requirement"], state["design"], revision_feedback,
+        model=_model_for(state, "quality"),
+        context_notes=_context_for("quality_planning", state),
+    )
+    return {
+        "quality_plan": quality_plan,
+        "history": append_history(
+            state, {"stage": "quality_planning", "status": "DONE", "result": quality_plan}
         ),
     }
 
@@ -459,6 +509,7 @@ def release_planning_node(state: SDLCState):
         state["requirement"], state["design"], revision_feedback,
         model=_model_for(state, "release"),
         context_notes=_context_for("release_planning", state),
+        quality_plan=state.get("quality_plan"),
     )
     return {
         "release_plan": release_plan,
@@ -575,6 +626,85 @@ def apply_ticket_edits(state: SDLCState, edited_plan: dict) -> dict:
         state, {"stage": "ticket_edit", "status": "EDITED", "result": {"changes": changes}}
     )
     return update
+
+
+# ============================================================
+# EDITING THE WORDING OF THE REQUIREMENT
+#
+# The user may reword the requirement before the Design agent uses it (the web UI
+# offers this at the pause after the Requirement agent, and when a run stops
+# there). Only four things can change - the title, the scope, the acceptance
+# criteria and the out-of-scope list. The agent's other fields (its business
+# goal, build mode and open questions) are left exactly as they were.
+# ============================================================
+
+_REQUIREMENT_EDITABLE = ("title", "scope_summary", "acceptance_criteria", "out_of_scope")
+
+
+def requirement_text_changes(old: dict, new: dict) -> List[str]:
+    """Which editable parts of the requirement differ (by field name)."""
+    return [k for k in _REQUIREMENT_EDITABLE if old.get(k) != new.get(k)]
+
+
+def apply_requirement_edits(state: SDLCState, edited: dict) -> dict:
+    """Accept the user's reworded requirement. Returns the state update (empty if
+    nothing changed). Raises ValueError, changing nothing, if the edit would alter
+    anything but those four fields, leave one empty, or come too late (the design
+    was already made from the earlier wording)."""
+    old = state["requirement"]
+    if state.get("design"):
+        raise ValueError(
+            "The design has already been made from the earlier wording, so the requirement can no "
+            "longer be edited. Edit it at the pause after the Requirement agent."
+        )
+    if {k: v for k, v in old.items() if k not in _REQUIREMENT_EDITABLE} != \
+            {k: v for k, v in edited.items() if k not in _REQUIREMENT_EDITABLE}:
+        raise ValueError("Only the title, scope, acceptance criteria and out-of-scope list can be edited.")
+    missing = [name for name, value in (("title", edited.get("title")), ("scope", edited.get("scope_summary")))
+               if not str(value or "").strip()]
+    criteria = edited.get("acceptance_criteria")
+    if not isinstance(criteria, list) or not criteria or any(not str(c).strip() for c in criteria):
+        missing.append("at least one acceptance criterion (and no blank ones)")
+    if missing:
+        raise ValueError("The requirement needs " + ", ".join(missing) + ".")
+
+    changes = requirement_text_changes(old, edited)
+    if not changes:
+        return {}
+
+    # Keep the shared whiteboard and the diary in step with the new wording.
+    iteration = state.get("iteration", 0)
+    _post_stage_output(state["run_id"], "requirement", {"requirement": edited}, iteration)
+    events.emit(state["run_id"], "requirement_edited", "requirement", fields=changes)
+    return {
+        "requirement": edited,
+        "history": append_history(
+            state, {"stage": "requirement_edit", "status": "EDITED", "result": {"changes": changes}}
+        ),
+    }
+
+
+def apply_quality_plan_edits(state: SDLCState, edited: dict) -> dict:
+    """Accept the user's edited test plan (summary and test cases). Returns the state update
+    (empty if nothing changed). Raises ValueError, changing nothing, if a case is incomplete or
+    an acceptance criterion would be left uncovered, or if the release plan already exists."""
+    old = state.get("quality_plan") or {}
+    if state.get("release_plan"):
+        raise ValueError("The release plan has already been made, so the test plan can no longer be edited.")
+    if not str(edited.get("summary") or "").strip():
+        raise ValueError("The test plan needs a summary.")
+    quality_agent._validate(edited, set(quality_agent.criteria_ids(state.get("requirement") or {})))
+    if edited == old:
+        return {}
+    events.emit(state["run_id"], "quality_plan_edited", "quality_planning",
+                fields=[c.get("id") for c in edited.get("test_cases", [])][:40])
+    return {
+        "quality_plan": edited,
+        "history": append_history(
+            state, {"stage": "quality_plan_edit", "status": "EDITED",
+                    "result": {"test_cases": len(edited.get("test_cases", []))}}
+        ),
+    }
 
 
 @_hive("jira_publish")
@@ -727,6 +857,84 @@ def _kb_return(state: SDLCState, result: dict, approved) -> dict:
     }
 
 
+def doc_meta(state: SDLCState) -> dict:
+    """The small facts printed under the design document's title."""
+    return {"run_id": state.get("run_id", ""),
+            "knowledge_base": "" if _is_scratch(state) else state.get("kb_name", "")}
+
+
+def apply_design_doc_edits(state: SDLCState, edits: dict) -> dict:
+    """Accept the user's wording changes to the design document. Returns the state update
+    (empty if nothing really changed). Raises ValueError, changing nothing, if a change points
+    at something that cannot be reworded or empties something that needs text."""
+    kept = design_doc.normalise_edits(state["design"], state.get("requirement"), edits)
+    if kept == (state.get("design_doc_edits") or {}):
+        return {}
+    events.emit(state["run_id"], "design_doc_edited", "design", fields=sorted(kept)[:40])
+    return {
+        "design_doc_edits": kept,
+        # A published page no longer matches the words: it will be offered again.
+        "confluence_approved": None,
+        "history": append_history(
+            state, {"stage": "design_doc_edit", "status": "EDITED", "result": {"changes": sorted(kept)}}
+        ),
+    }
+
+
+@_hive("confluence_publish")
+def confluence_publish_node(state: SDLCState):
+    # STEP 7: publish the design as a Confluence page - only with approval.
+    #   * nothing to publish (no change required) -> skipped
+    #   * Confluence not configured               -> skipped (the document can still be downloaded)
+    #   * no approval / the human said no         -> declined (nothing is sent)
+    #   * approved                                -> build the page and its diagrams and publish;
+    #                                                on an error record the failure, don't crash
+    design = state.get("design") or {}
+    if not design.get("change_required") or not design.get("components"):
+        result = {"status": "skipped", "reason": "There is no design document to publish."}
+        return _confluence_return(state, result, None)
+
+    # Already published from the frozen-architecture step: nothing more to send.
+    already = state.get("confluence_result") or {}
+    if already.get("status") == "published" and state.get("confluence_approved"):
+        return _confluence_return(state, already, True)
+
+    edits = state.get("design_doc_edits") or {}
+    _, title = design_doc.effective(design, state.get("requirement"), edits)
+    preview = confluence_client.preview(title, len(design_doc.attachment_names(design)))
+
+    approved = state.get("confluence_approved")
+    if preview["configured"] and approved is None and callable(state.get("confluence_confirm")):
+        approved = bool(state["confluence_confirm"](preview))
+
+    if not preview["configured"]:
+        result = {"status": "skipped",
+                  "reason": "Confluence is not configured (missing: " + ", ".join(preview["missing"]) + ")."}
+    elif not approved:
+        result = {"status": "declined",
+                  "reason": "Not approved, so nothing was sent to Confluence. The document can still be downloaded."}
+    else:
+        try:
+            package = design_doc.confluence_package(state.get("requirement"), design, doc_meta(state), edits)
+            result = confluence_client.from_env().publish(
+                package["title"], package["body"], package["attachments"], state["run_id"],
+                state_path=config.RUNS_ROOT / state["run_id"] / "confluence_created.json",
+            )
+        except confluence_client.ConfluenceError as exc:
+            result = {"status": "failed", "error": str(exc)}
+    return _confluence_return(state, result, approved)
+
+
+def _confluence_return(state: SDLCState, result: dict, approved) -> dict:
+    return {
+        "confluence_result": result,
+        "confluence_approved": approved,
+        "history": append_history(
+            state, {"stage": "confluence_publish", "status": result["status"].upper(), "result": result}
+        ),
+    }
+
+
 @_hive("finalize")
 def finalize_node(state: SDLCState):
     # STEP 5 (always last): work out how the run ended and save a summary
@@ -811,7 +1019,7 @@ def design_router(state: SDLCState):
     # documents the design proposed.
     if state.get("stop_after") == "design":
         return "kb_save"
-    return "release_planning"
+    return "quality_planning"
 
 
 # ============================================================
@@ -826,10 +1034,12 @@ def build_graph():
     # Register every step by name.
     graph.add_node("requirement", requirement_node)
     graph.add_node("design", design_node)
+    graph.add_node("quality_planning", quality_planning_node)
     graph.add_node("release_planning", release_planning_node)
     graph.add_node("release_apply", release_apply_node)
     graph.add_node("jira_publish", jira_publish_node)
     graph.add_node("kb_save", kb_save_node)
+    graph.add_node("confluence_publish", confluence_publish_node)
     graph.add_node("finalize", finalize_node)
 
     # Fixed arrows ("edge" = always go from A to B):
@@ -847,14 +1057,16 @@ def build_graph():
     graph.add_conditional_edges(
         "design",
         design_router,
-        {"release_planning": "release_planning", "kb_save": "kb_save", "finalize": "finalize"},
+        {"quality_planning": "quality_planning", "kb_save": "kb_save", "finalize": "finalize"},
     )
 
     # The final stretch is always in this fixed order.
+    graph.add_edge("quality_planning", "release_planning")
     graph.add_edge("release_planning", "release_apply")
     graph.add_edge("release_apply", "jira_publish")
     graph.add_edge("jira_publish", "kb_save")
-    graph.add_edge("kb_save", "finalize")
+    graph.add_edge("kb_save", "confluence_publish")
+    graph.add_edge("confluence_publish", "finalize")
     graph.add_edge("finalize", END)
 
     # "Compile" turns the drawing into something that can be executed.

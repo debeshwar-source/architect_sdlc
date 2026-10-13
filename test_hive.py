@@ -9,6 +9,7 @@ by canned answers where a whole run is tested.
 """
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -21,7 +22,8 @@ os.environ["CLAUDE_SDLC_ARCHITECT_RUNS_ROOT"] = tempfile.mkdtemp()
 os.environ["CLAUDE_SDLC_ARCHITECT_KB_ROOT"] = tempfile.mkdtemp()
 # Never let a developer's real Jira credentials (in .env) leak into tests:
 # variables set here (even empty) take precedence over the .env file.
-for _name in ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY"):
+for _name in ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY", "CONFLUENCE_BASE_URL",
+              "CONFLUENCE_EMAIL", "CONFLUENCE_API_TOKEN", "CONFLUENCE_SPACE_KEY", "CONFLUENCE_PARENT_PAGE_ID"):
     os.environ[_name] = ""
 
 import config
@@ -148,6 +150,20 @@ def _design(**over):
         "architecture_risks": ["r"], "knowledge_base_updates": [], "clarifying_questions": [],
     }
     base.update(over)
+    # The architecture: unless a test gives its own, derive a valid one from the applications
+    # named - one component each, joined in a chain so none is left unconnected.
+    base.setdefault("overview", "A short description of the architecture.")
+    if "components" not in over:
+        base["components"] = (
+            [{"name": a["name"], "kind": "service", "status": "changed", "responsibility": "r", "technology": "",
+              "interfaces": [], "data_owned": []} for a in base["affected_applications"]]
+            + [{"name": a["name"], "kind": "service", "status": "new", "responsibility": "r", "technology": "",
+                "interfaces": [], "data_owned": []} for a in base["new_applications_needed"]])
+    if "connections" not in over:
+        names = [c["name"] for c in base["components"]]
+        base["connections"] = [{"from": names[i], "to": names[i + 1], "kind": "sync_api", "protocol": "REST",
+                                "label": "calls", "description": "", "contract": ""} for i in range(len(names) - 1)]
+    base.setdefault("flows", [])
     return base
 
 
@@ -235,13 +251,28 @@ def test_issue_tracker_writes_epic_story_task_subtask():
 # A whole pipeline run, from scratch, with the AI replaced by canned answers
 # ------------------------------------------------------------
 
+def _auto_quality_plan(prompt):
+    # A test plan that covers whatever acceptance criteria (AC-1, AC-2, ...) the prompt lists, so tests
+    # that are not about the Quality Planner need not script it.
+    labels = re.findall(r"^(AC-\d+):", prompt, flags=re.M)
+    cases = [{
+        "id": f"TC-{i:03d}", "title": f"Check {label}", "requirement_refs": [label], "component": "End-to-end",
+        "type": "Functional", "priority": "High", "preconditions": "The system is running.",
+        "steps": ["Do the thing", "Look at the result"], "test_data": "", "expected_result": "It behaves as required.",
+    } for i, label in enumerate(labels, start=1)] or [{
+        "id": "TC-001", "title": "Basic check", "requirement_refs": [], "component": "End-to-end", "type": "Functional",
+        "priority": "Medium", "preconditions": "", "steps": ["Use it"], "test_data": "", "expected_result": "It works.",
+    }]
+    return {"summary": "Cover each criterion once.", "test_cases": cases, "clarifying_questions": []}
+
+
 def _fake_llm(responses, log=None):
     # Replaces the real AI with canned answers. If `log` is given, every
     # prompt that WOULD have been sent to the AI is recorded as (agent, prompt).
     def fake(prompt, agent_name, required_keys=None, system=None, max_repair_attempts=2, model=None, validate=None):
         if log is not None:
             log.append((agent_name, prompt))
-        out = responses[agent_name]
+        out = responses[agent_name] if agent_name in responses else _auto_quality_plan(prompt)
         missing = set(required_keys or []) - set(out)
         assert not missing, f"{agent_name} canned answer lacks {missing}"
         if validate is not None:
@@ -474,7 +505,7 @@ def test_user_flag_withholds_knowledge_base_and_memory_from_every_agent():
     _remember_old_project()
     final, log = _run_pipeline(docs, "Build a todo app with notify users reminders",
                                _scratch_canned("extend_existing"), force_from_scratch=True)
-    assert {a for a, _ in log} == {"Requirement Agent", "Design Agent", "Release Agent"}
+    assert {a for a, _ in log} == {"Requirement Agent", "Design Agent", "Quality Planner Agent", "Release Agent"}
     for agent, prompt in log:
         assert SECRET not in prompt and "user-service" not in prompt, f"{agent} saw the old system"
     assert final["from_scratch"] is True
@@ -946,7 +977,7 @@ def test_user_text_can_be_used_as_the_requirement_without_the_requirement_agent(
     canned = _scratch_canned("extend_existing")
     del canned["Requirement Agent"]                   # would raise KeyError if the agent were called
     final, log = _run_pipeline([], "Build a todo app", canned, start_at="design")
-    assert _agents(log) == {"Design Agent", "Release Agent"}
+    assert _agents(log) == {"Design Agent", "Quality Planner Agent", "Release Agent"}
     assert final["requirement_skipped"] and final["requirement"]["scope_summary"] == "Build a todo app"
     assert final["run_outcome"] == "APPROVED_RELEASED"
     assert "Build a todo app" in _prompt(log, "Design Agent")     # the user's own words reach the Design agent
@@ -983,7 +1014,7 @@ def test_routers_follow_the_chosen_stopping_point():
     assert graph.requirement_router({}) == "design"
     assert graph.requirement_router({"stop_after": "release"}) == "design"
     assert graph.requirement_router({"stop_after": "requirement"}) == "finalize"
-    assert graph.design_router({"change_required": True}) == "release_planning"
+    assert graph.design_router({"change_required": True}) == "quality_planning"
     assert graph.design_router({"change_required": True, "stop_after": "design"}) == "kb_save"
     assert graph.design_router({"change_required": False, "stop_after": "design"}) == "finalize"
 
@@ -993,7 +1024,7 @@ def test_architectural_direction_reaches_only_the_design_agent():
                                architecture_direction=f"  {DIRECTION}  ")
     design_prompt = _prompt(log, "Design Agent")
     assert "ARCHITECTURAL DIRECTION FROM THE USER (binding)" in design_prompt and DIRECTION in design_prompt
-    for agent in ("Requirement Agent", "Release Agent"):
+    for agent in ("Requirement Agent", "Quality Planner Agent", "Release Agent"):
         assert DIRECTION not in _prompt(log, agent), agent
     run_id = final["run_id"]
     shown = [e for e in blackboard.read(run_id)["human_decisions"] if e["stage"] == "direction"]
@@ -1116,6 +1147,85 @@ def test_design_and_release_also_get_a_second_chance():
                                         "rollout_narrative": "n", "monitoring_plan": [], "clarifying_questions": []}], prompts):
         result = release_agent.run({"title": "t"}, _design())
     assert result["stories"] and "no stories" in prompts[1]
+
+
+# ------------------------------------------------------------
+# Rewording the requirement
+# ------------------------------------------------------------
+
+def _requirement_state(**over):
+    req = {"title": "Todo", "business_goal": "UNIQUE-GOAL keep users organised", "scope_summary": "s",
+           "acceptance_criteria": ["a", "b"], "out_of_scope": ["x"], "build_mode": "from_scratch",
+           "clarifying_questions": [{"question": "q", "why_it_matters": "w", "options": ["o1", "o2"],
+                                     "recommended_option": "o1"}]}
+    return {"run_id": graph.new_run_id(), "requirement_text": "t", "requirement": req, "iteration": 0,
+            "history": [], **over}
+
+
+def test_the_requirement_wording_can_be_edited_and_everything_downstream_sees_it():
+    import copy
+    state = _requirement_state()
+    edited = copy.deepcopy(state["requirement"])
+    edited.update(title="Reworded title", scope_summary="Reworded scope", acceptance_criteria=["only one"], out_of_scope=[])
+    update = graph.apply_requirement_edits(state, edited)
+    assert update["requirement"] == edited
+    assert sorted(update["history"][-1]["result"]["changes"]) == sorted(
+        ["title", "scope_summary", "acceptance_criteria", "out_of_scope"])
+    assert any(e["kind"] == "requirement_edited" for e in events.read(state["run_id"]))
+    decisions = [e["text"] for e in blackboard.read(state["run_id"])["decisions"] if e["stage"] == "requirement" and e["status"] == "active"]
+    assert decisions == ["Reworded scope"]                                # the whiteboard follows the new wording
+    assert graph.apply_requirement_edits({**state, **update}, edited) == {}   # nothing further to change
+
+    # The Design agent is handed the edited requirement - and still the business goal, which is
+    # kept out of the DOCUMENT only.
+    log = []
+    original = llm.call_llm_json
+    llm.call_llm_json = _fake_llm({"Design Agent": _design()}, log)
+    try:
+        design_agent.run(update["requirement"], [])
+    finally:
+        llm.call_llm_json = original
+    prompt = log[0][1]
+    assert "Reworded scope" in prompt and "only one" in prompt and "UNIQUE-GOAL" in prompt
+
+
+def test_requirement_edits_may_only_change_the_four_text_fields():
+    import copy
+    state = _requirement_state()
+    before = copy.deepcopy(state)
+
+    def reject(mutate, expected):
+        edited = copy.deepcopy(state["requirement"])
+        mutate(edited)
+        try:
+            graph.apply_requirement_edits(state, edited)
+            raise AssertionError("expected ValueError")
+        except ValueError as e:
+            assert expected in str(e), str(e)
+        assert state == before                                           # a refused edit changes nothing
+
+    reject(lambda r: r.update(build_mode="extend_existing"), "Only the title")
+    reject(lambda r: r.update(business_goal="changed"), "Only the title")
+    reject(lambda r: r.update(clarifying_questions=[]), "Only the title")
+    reject(lambda r: r.update(extra="field"), "Only the title")
+    reject(lambda r: r.update(title="  "), "title")
+    reject(lambda r: r.update(scope_summary=""), "scope")
+    reject(lambda r: r.update(acceptance_criteria=[]), "acceptance criterion")
+    reject(lambda r: r.update(acceptance_criteria=["ok", "  "]), "acceptance criterion")
+    reject(lambda r: r.update(acceptance_criteria="not a list"), "acceptance criterion")
+
+
+def test_the_requirement_cannot_be_edited_once_the_design_exists():
+    import copy
+    state = _requirement_state(design={"change_required": True})
+    edited = copy.deepcopy(state["requirement"])
+    edited["title"] = "Too late"
+    try:
+        graph.apply_requirement_edits(state, edited)
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "design has already been made" in str(e)
+    assert state["requirement"]["title"] == "Todo"
 
 
 @contextmanager

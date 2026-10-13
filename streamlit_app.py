@@ -12,21 +12,67 @@ re-runs are kept in `st.session_state` (a per-visitor memory).
 """
 
 import copy
+import itertools
+import json
+import os
+from pathlib import Path
 import random
+import re
 import threading
 import time
 
 import streamlit as st
 
 import agents.discuss as discuss_agent
+import agents.quality as quality_agent
 import config
 import knowledge_base.loader as kb_loader
 import orchestrator.graph as graph
 import run_log
+import session_store
+import tools.confluence_client as confluence_client
+import tools.design_doc as design_doc
 import tools.jira_client as jira_client
+import tools.requirement_doc as requirement_doc
+import tools.test_plan_doc as test_plan_doc
 from hive import blackboard, events
 
 # Browser-tab title, icon and use the full page width.
+# Unique ids for the download buttons. (This line runs afresh on every Streamlit
+# re-run, so the numbering restarts each time and stays the same from run to run.)
+_DOWNLOAD_KEYS = itertools.count(1)
+
+
+def _save_to_downloads(key: str, data: bytes, file_name: str) -> None:
+    # Desktop window: write the file straight into the Downloads folder (never overwriting) and
+    # remember where, so the page can say so. Nothing is opened, so the person stays on the page.
+    try:
+        folder = Path.home() / "Downloads"
+        folder.mkdir(parents=True, exist_ok=True)
+        target, n = folder / file_name, 1
+        while target.exists():
+            target = folder / f"{Path(file_name).stem} ({n}){Path(file_name).suffix}"
+            n += 1
+        target.write_bytes(data)
+        st.session_state["_download_notice"] = (key, f"Saved to {target}")
+    except OSError as exc:
+        st.session_state["_download_notice"] = (key, f"Could not save the file: {exc}")
+
+
+def offer_download(column, label: str, data: bytes, file_name: str, mime: str, key: str) -> None:
+    """A download button. In a browser it is Streamlit's normal download. In the desktop window
+    (where a download link would navigate the window to the file, with no way back) it saves the
+    file to the Downloads folder in place and says where."""
+    if not os.environ.get("BLUEPRINT_PARENT_PID"):
+        column.download_button(label, data, file_name=file_name, mime=mime, key=key,
+                               on_click="ignore", use_container_width=True)
+        return
+    column.button(label, key=key, use_container_width=True,
+                  on_click=_save_to_downloads, args=(key, data, file_name))
+    notice = st.session_state.get("_download_notice")
+    if notice and notice[0] == key:
+        column.caption(notice[1])
+
 st.set_page_config(page_title="Blueprint · Claude SDLC", page_icon="📐", layout="wide")
 
 # A little custom styling (CSS): smaller code text, a small uppercase label
@@ -98,13 +144,12 @@ else:
 AGENT_DISPLAY_NAMES = {
     "requirement": "Requirement",
     "design": "Design",
-    "release": "Release Planning",
+    "quality": "Quality Planner",
+    "release": "Engineering Manager",
 }
 
-# The "Start with" / "Stop after" choices -> the stage they mean.
+# The "Start with" choices -> the stage they mean.
 START_OPTIONS = {"Requirement agent": "requirement", "Design agent (skip the Requirement agent)": "design"}
-STOP_OPTIONS = {"Requirement agent": "requirement", "Design agent": "design", "Release (Jira backlog)": "release"}
-STAGE_ORDER = ["requirement", "design", "release"]
 
 # ============================================================
 # INPUT FORM
@@ -169,37 +214,15 @@ with st.container(border=True):
         # "" means create something new; otherwise the chosen knowledge base's name.
         selected_kb = "" if kb_choice == NEW_KB_LABEL else knowledge_bases[kb_options.index(kb_choice)].name
 
-        # Which agents run. Start with the Requirement agent (normal), or skip it and
-        # let the Design agent work from your text exactly as written; and stop after
-        # the Requirement agent, the Design agent, or carry on through the release.
-        scope_col1, scope_col2 = st.columns(2)
-        start_choice = scope_col1.selectbox(
+        # Where the run starts: with the Requirement agent (normal), or skip it and let the
+        # Design agent work from your text exactly as written.
+        start_choice = st.selectbox(
             "Start with", list(START_OPTIONS), index=0,
             help=(
                 "The Requirement agent turns your request into a structured requirement. Choose the "
                 "Design agent to skip it: your text is then used as the requirement exactly as written "
                 "(useful when it is already precise)."
             ),
-        )
-        stop_choice = scope_col2.selectbox(
-            "Stop after", list(STOP_OPTIONS), index=len(STOP_OPTIONS) - 1,
-            help=(
-                "Where the run ends. After the Requirement agent you get just the structured requirement. "
-                "After the Design agent you get the design (and are still offered to save its knowledge-base "
-                "documents) but no Jira backlog. 'Release' runs everything."
-            ),
-        )
-
-        # Architectural changes made BETWEEN the Requirement and Design agents.
-        architecture_direction = st.text_area(
-            "Architectural direction for the Design agent (optional)",
-            height=90,
-            help=(
-                "Your own decisions about HOW to design it, e.g. 'reuse the existing event bus; no new "
-                "databases; keep the API backward compatible'. The Design agent treats this as binding. "
-                "In Human approval mode you can also add or change it after seeing the requirement."
-            ),
-            placeholder="e.g. Use the existing event bus; no new databases.",
         )
 
         # Optional: pick a different AI model for each agent. Only choices
@@ -235,7 +258,8 @@ with st.container(border=True):
 STAGE_META = [
     ("requirement", "Requirement", ":material/description:"),
     ("design", "Design", ":material/architecture:"),
-    ("release_apply", "Release", ":material/rocket_launch:"),
+    ("quality_planning", "Quality", ":material/fact_check:"),
+    ("release_apply", "Engineering", ":material/engineering:"),
 ]
 
 # Steps that share a slot on the progress bar with another step.
@@ -243,6 +267,7 @@ STAGE_ALIASES = {
     "release_planning": "release_apply",
     "jira_publish": "release_apply",
     "kb_save": "release_apply",
+    "confluence_publish": "release_apply",
     "finalize": "release_apply",
 }
 
@@ -251,6 +276,7 @@ STAGE_ALIASES = {
 RESULT_KEY = {
     "requirement": "requirement",
     "design": "design",
+    "quality_planning": "quality_plan",
     "release_planning": "release_plan",
 }
 
@@ -258,10 +284,12 @@ RESULT_KEY = {
 NODE_DISPLAY = {
     "requirement": "Requirement",
     "design": "Design",
-    "release_planning": "Release Planning",
+    "quality_planning": "Quality Planner",
+    "release_planning": "Engineering Manager",
     "release_apply": "Saving files",
     "jira_publish": "Jira",
     "kb_save": "Knowledge base",
+    "confluence_publish": "Confluence",
     "finalize": "Done",
 }
 
@@ -283,8 +311,6 @@ OUTCOME_DISPLAY = {
     "JIRA_FAILED": "Saved locally -- creating the Jira tickets failed",
     "APPROVED_RELEASED": "Approved -- backlog saved locally (not sent to Jira)",
     "NO_CHANGE_REQUIRED": "No change required",
-    "DESIGN_ONLY": "Stopped after the Design agent, as you chose",
-    "REQUIREMENT_ONLY": "Stopped after the Requirement agent, as you chose",
     "INCOMPLETE": "Incomplete",
     "UNKNOWN": "Unknown",
 }
@@ -300,21 +326,23 @@ def _humanize_outcome(value: str) -> str:
 NODE_FN = {
     "requirement": graph.requirement_node,
     "design": graph.design_node,
+    "quality_planning": graph.quality_planning_node,
     "release_planning": graph.release_planning_node,
     "release_apply": graph.release_apply_node,
     "jira_publish": graph.jira_publish_node,
     "kb_save": graph.kb_save_node,
+    "confluence_publish": graph.confluence_publish_node,
     "finalize": graph.finalize_node,
 }
 
 # Stages worth pausing on in human-in-the-loop mode -- release_apply
 # and finalize are excluded because they only execute a decision
 # (release_planning's plan) that was already gated one step earlier.
-GATED_NODE_NAMES = {"requirement", "design", "release_planning"}
+GATED_NODE_NAMES = {"requirement", "design", "quality_planning", "release_planning"}
 
 # Same set as GATED_NODE_NAMES, but ordered -- used to populate the
 # override gate's "send to" dropdown in a stable, pipeline-shaped order.
-OVERRIDE_TARGETS = ["requirement", "design", "release_planning"]
+OVERRIDE_TARGETS = ["requirement", "design", "quality_planning", "release_planning"]
 
 # What each node hands off to next. Reuses the graph's own router
 # functions as the source of truth so this can't drift out of sync
@@ -322,10 +350,12 @@ OVERRIDE_TARGETS = ["requirement", "design", "release_planning"]
 NEXT_NODE_FN = {
     "requirement": graph.requirement_router,
     "design": graph.design_router,
+    "quality_planning": lambda s: "release_planning",
     "release_planning": lambda s: "release_apply",
     "release_apply": lambda s: "jira_publish",
     "jira_publish": lambda s: "kb_save",
-    "kb_save": lambda s: "finalize",
+    "kb_save": lambda s: "confluence_publish",
+    "confluence_publish": lambda s: "finalize",
     "finalize": lambda s: None,
 }
 
@@ -351,100 +381,6 @@ def render_pipeline(completed_node: str = None) -> None:
                 st.badge(label, color="gray")
 
 
-# --- Architecture diagrams ---
-# The diagrams are described in "DOT", a plain-text language for graphs
-# (boxes and arrows) that Streamlit can draw.
-
-def _dot_escape(text: str) -> str:
-    # Make a name safe to place inside quotes in the diagram text.
-    return text.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _run_apps():
-    # The applications of the knowledge base THIS run is using (empty when the
-    # user chose "create something new").
-    return st.session_state.get("pipeline_state", {}).get("applications", [])
-
-
-def _existing_design_dot() -> str:
-    """The architecture as it exists TODAY -- every known application
-    and the call edges already documented in the knowledge base, via
-    kb_loader.existing_dependency_edges(). Independent of any run's
-    output; always the same picture until the KB itself changes."""
-    # Diagram header and default box/arrow styling.
-    lines = [
-        "digraph existing {",
-        '  rankdir="LR";',
-        '  bgcolor="transparent";',
-        '  node [shape=box, style=filled, fillcolor="#EEF1FB", color="#4F46E5", fontname="Helvetica"];',
-        '  edge [color="#6B7280"];',
-    ]
-    # One box per application...
-    apps = _run_apps()
-    for app in apps:
-        lines.append(f'  "{_dot_escape(app.name)}";')
-    # ...and one arrow for each documented "A depends on B".
-    for caller, callee in kb_loader.existing_dependency_edges(apps):
-        lines.append(f'  "{_dot_escape(caller)}" -> "{_dot_escape(callee)}";')
-    lines.append("}")
-    return "\n".join(lines)
-
-
-def _new_design_dot(arch: dict, apps=None) -> str:
-    """The architecture AFTER this run's proposed change: every known
-    application plus any new ones, with affected/new applications and
-    newly proposed contracts highlighted against the same baseline
-    edges existing_dependency_edges() produced, so the diff is visible
-    in one picture rather than requiring a side-by-side diff."""
-    affected_names = {a["name"] for a in arch.get("affected_applications", [])}
-    new_apps = arch.get("new_applications_needed", [])
-    new_names = {a["name"] for a in new_apps}
-
-    # Colour key: orange = application being changed, green dashed = brand
-    # new application, blue = untouched, red arrows = new agreements
-    # (contracts) between services.
-    lines = [
-        "digraph new_design {",
-        '  rankdir="LR";',
-        '  bgcolor="transparent";',
-        '  node [shape=box, style=filled, fontname="Helvetica"];',
-    ]
-    # Existing applications (orange if affected by the change).
-    # `apps` is the existing applications to draw. A from-scratch build passes
-    # an empty list so none of the existing system appears in the picture.
-    apps = _run_apps() if apps is None else apps
-    for app in apps:
-        name = _dot_escape(app.name)
-        if app.name in affected_names:
-            lines.append(f'  "{name}" [fillcolor="#FDE9D9", color="#D97706", penwidth=2];')
-        else:
-            lines.append(f'  "{name}" [fillcolor="#EEF1FB", color="#4F46E5"];')
-    # Brand-new applications the plan proposes.
-    for a in new_apps:
-        name = _dot_escape(a["name"])
-        lines.append(
-            f'  "{name}" [fillcolor="#DCFCE7", color="#16A34A", penwidth=2, style="filled,dashed"];'
-        )
-
-    # Existing arrows, drawn faintly in the background.
-    for caller, callee in kb_loader.existing_dependency_edges(apps):
-        lines.append(
-            f'  "{_dot_escape(caller)}" -> "{_dot_escape(callee)}" [color="#D1D5DB"];'
-        )
-    # New contracts: a bold red arrow from the producer to each consumer.
-    for contract in arch.get("cross_service_contracts", []):
-        producer = contract.get("producer", "")
-        label = _dot_escape(contract.get("name", ""))
-        for consumer in contract.get("consumers", []):
-            lines.append(
-                f'  "{_dot_escape(producer)}" -> "{_dot_escape(consumer)}" '
-                f'[color="#DC2626", penwidth=2, label="{label}", fontcolor="#DC2626"];'
-            )
-
-    lines.append("}")
-    return "\n".join(lines)
-
-
 def render_clarifying_questions(stage_result: dict) -> None:
     # Show the AI's open questions in a collapsible box (read-only).
     questions = stage_result.get("clarifying_questions", [])
@@ -458,6 +394,460 @@ def render_clarifying_questions(stage_result: dict) -> None:
             for opt in q.get("options", []):
                 marker = " (recommended)" if opt == q.get("recommended_option") else ""
                 st.write(f"- {opt}{marker}")
+
+
+def _apply_requirement_edit(edited: dict) -> None:
+    # Save the reworded requirement into the run (so the Design agent and the downloads
+    # use it) and refresh what is shown for the requirement stage.
+    try:
+        update = graph.apply_requirement_edits(st.session_state.pipeline_state, edited)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+    st.session_state.pipeline_state.update(update)
+    if "requirement" in update:
+        events_list = st.session_state.completed_events
+        last = max((i for i, (n, _) in enumerate(events_list) if n == "requirement"), default=None)
+        if last is not None:
+            events_list[last] = ("requirement", {**events_list[last][1], "requirement": edited})
+
+
+def _same_or_new(old, new_text: str):
+    # Typing the same words (ignoring spaces at the ends) is not an edit: keep the original.
+    return old if (old or "").strip() == new_text.strip() else new_text.strip()
+
+
+def render_requirement_editor(req: dict, edit_id: int) -> None:
+    """Boxes to reword the requirement: title, scope, acceptance criteria, out of scope.
+    The edits are saved by "Save wording changes", or automatically when the person
+    presses Approve at the pause. A title, scope and at least one criterion are required."""
+    key = lambda name: f"requirement_edit_{edit_id}_{name}"
+    with st.expander("✎ Edit the wording of this requirement", expanded=False):
+        edited = copy.deepcopy(req)
+        edited["title"] = _same_or_new(req.get("title"), st.text_input(
+            "Title", value=req.get("title", ""), key=key("title")))
+        edited["scope_summary"] = _same_or_new(req.get("scope_summary"), st.text_area(
+            "Scope", value=req.get("scope_summary", ""), height=120, key=key("scope")))
+        criteria = _lines(st.text_area(
+            "Acceptance criteria (one per line)", value="\n".join(req.get("acceptance_criteria", [])),
+            height=140, key=key("criteria")))
+        edited["acceptance_criteria"] = (
+            req.get("acceptance_criteria") if criteria == _lines("\n".join(req.get("acceptance_criteria", []))) else criteria)
+        out_of_scope = _lines(st.text_area(
+            "Out of scope (one per line)", value="\n".join(req.get("out_of_scope", [])),
+            height=100, key=key("out_of_scope")))
+        edited["out_of_scope"] = (
+            req.get("out_of_scope") if out_of_scope == _lines("\n".join(req.get("out_of_scope", []))) else out_of_scope)
+
+        changes = graph.requirement_text_changes(req, edited)
+        problems = (
+            (["a title"] if not edited["title"].strip() else [])
+            + (["a scope"] if not edited["scope_summary"].strip() else [])
+            + (["at least one acceptance criterion"] if not edited["acceptance_criteria"] else [])
+        )
+        if problems:
+            st.error("The requirement needs " + ", ".join(problems) + ". Fix this to keep your changes.")
+        elif changes:
+            st.caption(
+                f"✎ {len(changes)} wording edit(s). They are saved when you press Freeze requirements, "
+                "or press Save now. (Using Reconsider instead has the agent rewrite the "
+                "requirement, which replaces these edits.)"
+            )
+        # Remembered for the Approve button, which saves them and refuses while they are invalid.
+        st.session_state["_pending_requirement_edit"] = edited if (changes and not problems) else None
+        st.session_state["_requirement_edit_invalid"] = bool(problems)
+        if st.button("Save wording changes", key=key("save"), disabled=bool(problems) or not changes):
+            _apply_requirement_edit(edited)
+            st.rerun()
+
+
+@st.cache_data(show_spinner=False)
+def _diagram_images(design_json: str, requirement_json: str, edits_json: str) -> dict:
+    # The diagrams are drawn once per distinct design + wording, not on every re-run of the page.
+    return design_doc.build_images(json.loads(design_json), json.loads(requirement_json), json.loads(edits_json))
+
+
+def _apply_design_edits(edits: dict) -> None:
+    # Save the user's wording changes to the design document (the design itself is not touched).
+    try:
+        update = graph.apply_design_doc_edits(st.session_state.pipeline_state, edits)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+    st.session_state.pipeline_state.update(update)
+
+
+def render_design_wording_editor(design: dict, req: dict, edit_id: int) -> None:
+    """Boxes to reword the design document: its title, overview and every description, label and
+    note. Names, kinds, statuses and who-talks-to-whom are NOT editable here (that is structure:
+    use "Revise the design" to have the Design agent change it). Saved by "Save wording changes",
+    or automatically when the person approves; an empty required field blocks both."""
+    state = st.session_state.pipeline_state
+    current = state.get("design_doc_edits") or {}
+    try:
+        fields = design_doc.editable_fields(design, req, current)
+    except ValueError:                      # edits that no longer fit this design: start from the original
+        current, fields = {}, design_doc.editable_fields(design, req, {})
+    key = lambda path: f"design_edit_{edit_id}_{path}"
+    proposed = {}
+    with st.expander("✎ Edit the wording of the design document", expanded=False):
+        st.caption(
+            "Change the words only. Which components exist and how they connect stay as the Design agent "
+            "made them; to change those, use “Revise the design” at the pause. Edits show in the document, "
+            "the diagrams' labels, the downloads and the Confluence page."
+        )
+        section = None
+        for f in fields:
+            if f["section"] != section:
+                section = f["section"]
+                st.markdown(f"**{section}**")
+            if f["kind"] == "line":
+                proposed[f["path"]] = st.text_input(f["label"], value=f["value"], key=key(f["path"]))
+            elif f["kind"] == "text":
+                height = max(68, min(240, 30 + 22 * (len(f["value"]) // 80 + 1)))
+                proposed[f["path"]] = st.text_area(f["label"], value=f["value"], height=height, key=key(f["path"]))
+            else:
+                proposed[f["path"]] = _lines(st.text_area(
+                    f["label"], value="\n".join(f["value"]), height=90, key=key(f["path"])))
+        try:
+            kept, problem = design_doc.normalise_edits(design, req, proposed), ""
+        except ValueError as exc:
+            kept, problem = None, str(exc)
+        unsaved = kept is not None and kept != current
+        if problem:
+            st.error(problem + ". Fix this to keep your changes.")
+        elif unsaved:
+            st.caption("✎ Unsaved wording changes. They are saved when you approve, or press Save now.")
+        st.session_state["_pending_design_edits"] = kept if unsaved else None
+        st.session_state["_design_edit_invalid"] = bool(problem)
+        if st.button("Save wording changes", key=key("save"), disabled=bool(problem) or not unsaved):
+            _apply_design_edits(kept)
+            st.rerun()
+
+
+def render_design_document(design: dict, req: dict, editable: bool = False, edit_id: int = 0,
+                           final: bool = False) -> None:
+    """The Design agent's output as a design document: overview, architecture diagram, tables of
+    components and interconnections, flow diagrams, build order and the rest - shown here exactly
+    as it will appear in the downloads and on the Confluence page. The person may reword it, and
+    download it as Word or PDF."""
+    state = st.session_state.get("pipeline_state", {})
+    req = req or {}
+    edits = state.get("design_doc_edits") or {}
+    direction = (state.get("architecture_direction") or "").strip()
+    if direction:
+        st.caption(f"Following your architectural direction: {direction}")
+    try:
+        meta = graph.doc_meta(state)
+        model = design_doc.build_model(req, design, meta, edits)
+        images = _diagram_images(json.dumps(design, sort_keys=True, default=str),
+                                 json.dumps(req, sort_keys=True, default=str), json.dumps(edits, sort_keys=True))
+    except Exception as exc:  # noqa: BLE001 -- a document problem must never break the page
+        st.error(f"Could not build the design document: {exc}")
+        return
+
+    st.markdown(f"### {model['title']}")
+    st.caption("  ·  ".join(f"{k}: {v}" for k, v in model["meta"]))
+    for b in model["blocks"]:
+        kind = b["type"]
+        if kind == "h1":
+            st.markdown(f"#### {b['text']}")
+        elif kind == "h2":
+            st.markdown(f"**{b['text']}**")
+        elif kind == "p":
+            if b.get("style") == "bold":
+                st.markdown(f"**{b['text']}**")
+            elif b.get("style") == "muted":
+                st.caption(b["text"])
+            else:
+                st.write(b["text"])
+        elif kind == "bullets":
+            st.markdown("\n".join(f"- {i}" for i in b["items"]))
+        elif kind == "numbered":
+            st.markdown("\n".join(f"{label} {text}" for label, text in b["items"]))
+        elif kind == "table":
+            st.markdown(design_doc.table_markdown(b, rich=True))
+        elif kind == "image" and b["key"] in images:
+            st.image(images[b["key"]], caption=b["caption"], use_container_width=True)
+
+    # Proposed knowledge-base documents (nothing is saved until the end).
+    kb_updates = design.get("knowledge_base_updates", [])
+    if kb_updates:
+        with st.expander(f"Knowledge base changes ({len(kb_updates)})", expanded=False):
+            st.caption("Nothing is saved yet. At the end of the release you'll be asked whether to save "
+                       "these — as a new knowledge base, or into the one you selected.")
+            for u in kb_updates:
+                st.markdown(f"**{'Create' if u.get('action') == 'create' else 'Append to'}** `{u.get('application', '')}`")
+                if u.get("reason"):
+                    st.caption(u["reason"])
+                st.code(u.get("content", ""), language="markdown")
+
+    if not final:
+        st.caption("Draft — discuss it, ask for changes or reword it below. When you are happy, freeze the "
+                   "architecture to download it or publish it to Confluence.")
+        if editable:
+            render_design_wording_editor(design, req, edit_id)
+        with st.expander("Raw data (JSON)", expanded=False):
+            st.json(design)
+        return
+    st.caption("Download this design as a document — pick the format you prefer.")
+    columns = st.columns(len(design_doc.FORMATS))
+    for column, fmt in zip(columns, design_doc.FORMATS):
+        label = design_doc.FORMATS[fmt][0]
+        try:
+            data, file_name, mime = design_doc.build(req, design, meta, edits, fmt)
+        except design_doc.MissingLibrary as exc:
+            column.caption(str(exc))
+            continue
+        except Exception as exc:  # noqa: BLE001
+            column.caption(f"Could not make the {label}: {exc}")
+            continue
+        offer_download(column, f"Download design as {label}", data, file_name, mime,
+                       f"download_design_{next(_DOWNLOAD_KEYS)}")
+    with st.expander("Raw data (JSON)", expanded=False):
+        st.json(design)
+
+
+def render_freeze_confluence(state: dict, gate_n: int) -> None:
+    """In the frozen-architecture box: publish the design to Confluence now, if it is set up."""
+    design = state.get("design") or {}
+    if not (design.get("change_required") and design.get("components")):
+        return
+    if not confluence_client.is_configured():
+        st.caption("Confluence is not set up, so the document can only be downloaded.")
+        return
+    result = state.get("confluence_result") or {}
+    _, page_title = design_doc.effective(design, state.get("requirement") or {}, state.get("design_doc_edits"))
+    cf = confluence_client.preview(page_title, len(design_doc.attachment_names(design)))
+    st.caption(f"Confluence: {cf['base_url']} · space {cf['space_key']} · page “{page_title}” · "
+               f"{cf['attachments']} diagram(s) attached. An existing page with this title is never overwritten.")
+    published = result.get("status") == "published"
+    if st.button("Publish again to Confluence" if published else "Publish to Confluence",
+                 key=f"freeze_cf_{gate_n}", use_container_width=True):
+        with st.spinner("Publishing to Confluence…"):
+            state.update(graph.confluence_publish_node({**state, "confluence_approved": True, "confluence_result": {}}))
+        st.rerun()
+    if result:
+        render_confluence_result(result)
+
+
+def _apply_quality_edit(edited: dict) -> None:
+    # Save the edited test plan into the run and refresh what is shown for the quality stage.
+    try:
+        update = graph.apply_quality_plan_edits(st.session_state.pipeline_state, edited)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+    st.session_state.pipeline_state.update(update)
+    if "quality_plan" in update:
+        events_list = st.session_state.completed_events
+        last = max((i for i, (n, _) in enumerate(events_list) if n == "quality_planning"), default=None)
+        if last is not None:
+            events_list[last] = ("quality_planning", {**events_list[last][1], "quality_plan": edited})
+
+
+def render_quality_editor(plan: dict, req: dict, edit_id: int) -> None:
+    """Boxes to edit the test plan: its summary and every field of every test case, plus removing
+    a case or adding a new one. Saved by "Save test plan changes", or automatically when the
+    person freezes the plan. Every case needs its text, and every acceptance criterion must stay
+    covered by at least one case."""
+    key = lambda *parts: "quality_edit_" + str(edit_id) + "_" + "_".join(str(p) for p in parts)
+    labels = list(quality_agent.criteria_ids(req or {}))
+    with st.expander("✎ Edit the test plan", expanded=False):
+        edited = copy.deepcopy(plan)
+        edited["summary"] = st.text_area("Approach summary", value=plan.get("summary", ""),
+                                         height=100, key=key("summary"))
+        kept = []
+        for c in plan.get("test_cases", []):
+            cid = c.get("id")
+            with st.container(border=True):
+                head, drop = st.columns([5, 2])
+                head.markdown(f"**{cid}**")
+                if drop.checkbox("Remove this case", key=key(cid, "remove")):
+                    continue
+                n = copy.deepcopy(c)
+                n["title"] = st.text_input("Title", value=c.get("title", ""), key=key(cid, "title"))
+                n["component"] = st.text_input("Component", value=c.get("component", ""), key=key(cid, "component"))
+                t_col, p_col = st.columns(2)
+                n["type"] = t_col.selectbox(
+                    "Type", quality_agent.CASE_TYPES, key=key(cid, "type"),
+                    index=quality_agent.CASE_TYPES.index(c["type"]) if c.get("type") in quality_agent.CASE_TYPES else 0)
+                n["priority"] = p_col.selectbox(
+                    "Priority", quality_agent.PRIORITIES, key=key(cid, "priority"),
+                    index=quality_agent.PRIORITIES.index(c["priority"]) if c.get("priority") in quality_agent.PRIORITIES else 0)
+                n["requirement_refs"] = st.multiselect(
+                    "Covers acceptance criteria", labels, key=key(cid, "refs"),
+                    default=[r for r in c.get("requirement_refs") or [] if r in labels])
+                n["preconditions"] = st.text_area("Before you start", value=c.get("preconditions") or "",
+                                                  height=68, key=key(cid, "pre"))
+                n["steps"] = _lines(st.text_area("Steps (one per line)", value="\n".join(c.get("steps") or []),
+                                                 height=130, key=key(cid, "steps")))
+                n["test_data"] = st.text_area("Test data", value=c.get("test_data") or "",
+                                              height=68, key=key(cid, "data"))
+                n["expected_result"] = st.text_area("Expected result", value=c.get("expected_result", ""),
+                                                    height=90, key=key(cid, "expected"))
+                kept.append(n)
+        edited["test_cases"] = kept
+
+        try:
+            graph.apply_quality_plan_edits({**st.session_state.pipeline_state, "quality_plan": {}}, edited)
+            problem = ""
+        except ValueError as exc:
+            problem = str(exc)
+        changed = edited != plan
+        if problem:
+            st.error(problem + " Fix this to keep your changes.")
+        elif changed:
+            st.caption("✎ Unsaved test plan changes. They are saved when you freeze the test plan, "
+                       "or press Save now. (Using Reconsider instead has the agent rewrite the plan, "
+                       "which replaces these edits.)")
+        st.session_state["_pending_quality_edit"] = edited if (changed and not problem) else None
+        st.session_state["_quality_edit_invalid"] = bool(problem)
+        save_col, add_col = st.columns(2)
+        if save_col.button("Save test plan changes", key=key("save"), disabled=bool(problem) or not changed):
+            _apply_quality_edit(edited)
+            st.rerun()
+        if add_col.button("Add a test case", key=key("add"), disabled=bool(problem)):
+            numbers = [int(m.group(1)) for c in edited["test_cases"] if (m := re.match(r"TC-(\d+)$", str(c.get("id"))))]
+            edited["test_cases"].append({
+                "id": f"TC-{max(numbers, default=0) + 1}", "title": "New test case",
+                "component": (kept[0].get("component") if kept else "") or "General",
+                "type": "Functional", "priority": "Medium",
+                "requirement_refs": [], "preconditions": "", "steps": ["Describe the first step"],
+                "test_data": "", "expected_result": "Describe the expected result",
+            })
+            _apply_quality_edit(edited)
+            st.rerun()
+
+
+def render_quality_plan(plan: dict, req: dict, final: bool = False, editable: bool = False, edit_id: int = 0) -> None:
+    """The Quality Planner's test plan: an approach summary, the test cases as a table, and which
+    cases cover which acceptance criterion. Once frozen it can be downloaded as an Excel workbook."""
+    cases = plan.get("test_cases", [])
+    st.write(plan.get("summary", ""))
+    meta = {"run_id": st.session_state.get("run_id", "")}
+    shown = test_plan_doc.counts(plan)
+    st.caption(f"{len(cases)} test case(s) · " + " · ".join(f"{n} {name.lower()}" for name, n in shown["type"].items()))
+    st.dataframe(
+        [{"ID": c.get("id"), "Title": c.get("title"), "Component": c.get("component"), "Type": c.get("type"),
+          "Priority": c.get("priority"), "Covers": ", ".join(c.get("requirement_refs") or [])} for c in cases],
+        hide_index=True, use_container_width=True,
+    )
+    for c in cases:
+        with st.expander(f"{c.get('id')} — {c.get('title')}", expanded=False):
+            st.caption(f"{c.get('component')} · {c.get('type')} · {c.get('priority')} priority"
+                       + (f" · covers {', '.join(c['requirement_refs'])}" if c.get("requirement_refs") else ""))
+            if c.get("preconditions"):
+                st.markdown(f"**Before you start:** {c['preconditions']}")
+            st.markdown("**Steps**\n\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(c.get("steps") or [], start=1)))
+            if c.get("test_data"):
+                st.markdown(f"**Test data:** {c['test_data']}")
+            st.markdown(f"**Expected result:** {c.get('expected_result', '')}")
+    with st.expander("Which test cases cover each acceptance criterion", expanded=False):
+        for item in test_plan_doc.coverage(req or {}, plan):
+            st.markdown(f"**{item['label']}** {item['criterion']}  \n"
+                        + (", ".join(item["cases"]) if item["cases"] else ":red[not covered]"))
+
+    if not final:
+        st.caption("Draft — discuss it, ask for changes or edit it below. When you are happy, freeze the test plan "
+                   "to download it as an Excel workbook.")
+        if editable:
+            render_quality_editor(plan, req, edit_id)
+        return
+    st.success("Test plan frozen. Download the Excel workbook, then continue.")
+    st.caption("Download this test plan as a spreadsheet.")
+    try:
+        data, file_name, mime = test_plan_doc.build(req or {}, plan, meta)
+    except test_plan_doc.MissingLibrary as exc:
+        st.caption(str(exc))
+    except Exception as exc:  # noqa: BLE001 -- a document problem must never break the page
+        st.caption(f"Could not make the Excel workbook: {exc}")
+    else:
+        offer_download(st, f"Download {test_plan_doc.FORMATS['xlsx'][0]}", data, file_name, mime,
+                       f"download_test_plan_{next(_DOWNLOAD_KEYS)}")
+    with st.expander("Raw data (JSON)", expanded=False):
+        st.json(plan)
+
+
+def render_confluence_result(result: dict) -> None:
+    # The outcome of the Confluence step: a link to the page, or why nothing was published.
+    status = result.get("status")
+    if status == "published":
+        st.markdown(f"Published: [{result['title']}]({result['url']})")
+        st.caption(
+            f"Space {result['space_key']} · {len(result.get('attachments', []))} diagram(s) attached"
+            + (" · updated in place (a new version)" if result.get("updated") else "")
+            + (" · nothing had changed since it was last published" if result.get("unchanged") else "")
+        )
+    elif status == "failed":
+        st.error(result.get("error", "Publishing to Confluence failed."))
+        st.caption("The document is still available to download above. Fix the cause and retry; a retry "
+                   "resumes without creating a second page.")
+    else:
+        st.info(result.get("reason", "Nothing was published."))
+
+
+# The stages that end in a frozen, downloadable document: (button, what is frozen, the agent that follows).
+FREEZE = {
+    "requirement": ("Freeze requirements", "Requirements", "Design"),
+    "design": ("Freeze architecture", "Architecture", "Quality Planner"),
+    "quality_planning": ("Freeze test plan", "Test plan", "Engineering Manager"),
+}
+
+
+def stage_is_frozen(name: str) -> bool:
+    """True while the person has frozen this stage's output at the current pause."""
+    return st.session_state.get(f"{name}_frozen_at") == len(st.session_state.completed_events)
+
+
+def stage_shows_document(name: str) -> bool:
+    """Whether the finished document (with its downloads) is shown for this stage rather than the
+    draft: once frozen, once the run has moved past the stage, or in automatic mode (no pause)."""
+    events = st.session_state.completed_events
+    return (stage_is_frozen(name) or not st.session_state.human_in_the_loop
+            or not events or events[-1][0] != name)
+
+
+def render_requirement_document(req: dict, editable: bool = False, edit_id: int = 0, final: bool = False) -> None:
+    """The Requirement agent's output as a document: shown here, and downloadable as
+    Word or PDF - whichever the person prefers. The files are made on this computer.
+    If `editable`, the person can also reword it (only possible before the design exists)."""
+    state = st.session_state.get("pipeline_state", {})
+    meta = {
+        "run_id": st.session_state.get("run_id", ""),
+        # The knowledge base this run actually used (none when it started from scratch).
+        "knowledge_base": "" if state.get("from_scratch") else state.get("kb_name", ""),
+    }
+    st.markdown(requirement_doc.to_markdown(req, meta, compact=True))
+
+    if not final:
+        # Still being worked on: no document yet. It is produced when the person freezes the requirements.
+        st.caption("Draft — discuss it, answer the questions or reword it below. When you are happy, "
+                   "freeze the requirements to get the document to download.")
+        if editable:
+            render_requirement_editor(req, edit_id)
+        with st.expander("Raw data (JSON)", expanded=False):
+            st.json(req)
+        return
+    st.success("Requirements frozen. Download the document in the format you prefer, then continue.")
+    st.caption("Download this requirement as a document — pick the format you prefer.")
+    columns = st.columns(len(requirement_doc.FORMATS))
+    for column, fmt in zip(columns, requirement_doc.FORMATS):
+        label = requirement_doc.FORMATS[fmt][0]
+        try:
+            data, file_name, mime = requirement_doc.build(req, meta, fmt)
+        except requirement_doc.MissingLibrary as exc:
+            column.caption(str(exc))
+            continue
+        except Exception as exc:  # noqa: BLE001 -- a document problem must never break the page
+            column.caption(f"Could not make the {label}: {exc}")
+            continue
+        # on_click="ignore": clicking must not re-run the page, which could interrupt
+        # the stage that is running underneath.
+        offer_download(column, f"Download {label}", data, file_name, mime,
+                       f"download_requirement_{next(_DOWNLOAD_KEYS)}")
+    with st.expander("Raw data (JSON)", expanded=False):
+        st.json(req)
 
 
 def _lines(text: str) -> list:
@@ -582,20 +972,34 @@ def stage_label(node_name: str, node_result: dict, pass_number: int = 1) -> str:
         title = node_result.get("requirement", {}).get("title", "")
         return f"Requirement{suffix} — {title}" if title else f"Requirement{suffix}"
 
+    if node_name == "quality_planning":
+        n = len(node_result.get("quality_plan", {}).get("test_cases") or [])
+        return f"Quality Planner{suffix} — {n} test case(s)"
+
     if node_name == "design":
         design = node_result.get("design", {})
         tag = "change required" if design.get("change_required") else "no change needed"
-        return f"Design{suffix} — {tag}"
+        n = len(design.get("components") or [])
+        return f"Design{suffix} — {tag}" + (f" ({n} components)" if n else "")
 
     if node_name == "release_planning":
         plan = node_result.get("release_plan", {})
         title = plan.get("epic", {}).get("title", "")
         n = len(plan.get("stories", []))
-        head = f"Release Planning{suffix}"
+        head = f"Engineering Manager{suffix}"
         return f"{head} — {title} ({n} stories)" if title else head
 
     if node_name == "release_apply":
         return "Backlog saved locally"
+
+    if node_name == "confluence_publish":
+        status = node_result.get("confluence_result", {}).get("status")
+        return {
+            "published": "Confluence — published",
+            "declined": "Confluence — not published (no approval)",
+            "skipped": "Confluence — skipped",
+            "failed": "Confluence — failed",
+        }.get(status, "Confluence")
 
     if node_name == "kb_save":
         kb = node_result.get("kb_result", {})
@@ -633,9 +1037,10 @@ def stage_state(node_name: str, node_result: dict) -> str:
     return "complete"
 
 
-def render_stage_body(node_name: str, node_result: dict) -> None:
+def render_stage_body(node_name: str, node_result: dict, editable: bool = False, edit_id: int = 0) -> None:
     """Write one stage's detailed content. Must be called from inside
-    an open st.status(...) block, which supplies the header/icon."""
+    an open st.status(...) block, which supplies the header/icon. `editable` (used
+    only for the requirement) shows the boxes for rewording it."""
 
     # Each section below shows one stage's result in a readable layout.
     #
@@ -645,87 +1050,28 @@ def render_stage_body(node_name: str, node_result: dict) -> None:
         req = node_result.get("requirement", {})
         if node_result.get("requirement_skipped"):
             st.caption("The Requirement agent was skipped: your text is used as the requirement, exactly as written.")
-        st.write(req.get("scope_summary", ""))
-        with st.expander("Details", expanded=False):
-            st.json(req)
-        render_clarifying_questions(req)
+            st.write(req.get("scope_summary", ""))
+        else:
+            final = stage_shows_document("requirement")
+            render_requirement_document(req, editable=editable and not final, edit_id=edit_id, final=final)
 
     # DESIGN: affected apps (left), unaffected apps (right), build order,
     # test strategy, contracts, risks, knowledge-base changes, diagrams.
     # ------------------------------------------------
     elif node_name == "design":
         design = node_result.get("design", {})
-        direction = (st.session_state.get("pipeline_state", {}).get("architecture_direction") or "").strip()
-        if direction:
-            st.caption(f"Following your architectural direction: {direction}")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.caption("Affected / new applications")
-            affected = design.get("affected_applications", [])
-            new_apps = design.get("new_applications_needed", [])
-            if not affected and not new_apps:
-                st.write("—")
-            for a in affected:
-                st.markdown(f"**{a.get('name', '')}**")
-                st.caption(a.get("role_in_change", ""))
-            for a in new_apps:
-                st.markdown(f"**{a.get('name', '')}** :blue-badge[new]")
-                st.caption(a.get("purpose", ""))
-        with col2:
-            st.caption("Considered, not affected")
-            unaffected = design.get("unaffected_applications_considered", [])
-            if not unaffected:
-                st.write("—")
-            for a in unaffected:
-                st.markdown(f"**{a.get('name', '')}**")
-                st.caption(a.get("reason", ""))
+        render_design_document(design, st.session_state.get("pipeline_state", {}).get("requirement") or {},
+                               editable=editable and not stage_shows_document("design"), edit_id=edit_id,
+                               final=stage_shows_document("design"))
 
-        if design.get("dependency_order"):
-            st.write("**Dependency order:** " + " → ".join(design["dependency_order"]))
-        if design.get("test_strategy"):
-            st.write("**Test strategy:** " + design["test_strategy"])
-        if design.get("cross_service_contracts"):
-            with st.expander("Cross-service contracts", expanded=False):
-                st.json(design["cross_service_contracts"])
-        if design.get("architecture_risks"):
-            with st.expander("Risks", expanded=False):
-                for risk in design["architecture_risks"]:
-                    st.write(risk)
-
-        # Proposed knowledge-base changes (written when the release is published).
-        kb_updates = design.get("knowledge_base_updates", [])
-        if kb_updates:
-            with st.expander(f"Knowledge base changes ({len(kb_updates)})", expanded=True):
-                st.caption(
-                    "Nothing is saved yet. At the end of the release you'll be asked whether to "
-                    "save these — as a new knowledge base, or into the one you selected."
-                )
-                for u in kb_updates:
-                    verb = "Create" if u.get("action") == "create" else "Append to"
-                    st.markdown(f"**{verb}** `{u.get('application', '')}`")
-                    if u.get("reason"):
-                        st.caption(u["reason"])
-                    st.code(u.get("content", ""), language="markdown")
-
-        # Before / after diagrams. With no knowledge base there is no
-        # "before", so only the new design is drawn.
-        scratch = bool(st.session_state.get("pipeline_state", {}).get("from_scratch"))
-        if scratch:
-            st.caption("From-scratch build — the existing knowledge base was not used.")
-            st.graphviz_chart(_new_design_dot(design, []))
-        elif _run_apps():
-            diagram_col1, diagram_col2 = st.columns(2)
-            with diagram_col1:
-                st.caption("Existing design")
-                st.graphviz_chart(_existing_design_dot())
-            with diagram_col2:
-                st.caption("New design (orange = changed, green = new, red = new/changed contract)")
-                st.graphviz_chart(_new_design_dot(design))
-        else:
-            st.caption("New design (green = new, red = contract)")
-            st.graphviz_chart(_new_design_dot(design))
-
-        render_clarifying_questions(design)
+    # QUALITY PLANNING: the plain-English test plan (downloadable as Excel once frozen).
+    # ------------------------------------------------
+    elif node_name == "quality_planning":
+        plan = node_result.get("quality_plan", {})
+        render_quality_plan(plan, st.session_state.get("pipeline_state", {}).get("requirement") or {},
+                            final=stage_shows_document("quality_planning"),
+                            editable=editable and not stage_shows_document("quality_planning"), edit_id=edit_id)
+        render_clarifying_questions(plan)
 
     # RELEASE PLANNING: rollout story, the backlog (stories > tasks >
     # subtasks), and each rollout stage's go/no-go criteria and rollback plan.
@@ -783,6 +1129,12 @@ def render_stage_body(node_name: str, node_result: dict) -> None:
         else:
             st.info(kb.get("reason", "Nothing was saved."))
 
+    # CONFLUENCE: the design page published (with a link), or why it was not.
+    # ------------------------------------------------
+    elif node_name == "confluence_publish":
+        render_confluence_result(node_result.get("confluence_result", {}))
+
+    # ------------------------------------------------
     # JIRA PUBLISH: what happened when we tried to create the tickets in the
     # real Jira - links to every ticket, or why nothing was sent.
     # ------------------------------------------------
@@ -935,7 +1287,7 @@ def _is_gated(node: str) -> bool:
 
 def _start_new_run(
     requirement_text: str, human_in_the_loop: bool, agent_models: dict, kb_name: str = "",
-    start_at: str = "requirement", stop_after: str = "release", direction: str = "",
+    start_at: str = "requirement",
 ) -> None:
     # Reset the per-visitor memory (session_state) for a brand-new run.
     run_id = graph.new_run_id()
@@ -954,8 +1306,6 @@ def _start_new_run(
         "kb_name": kb_name,
         "force_from_scratch": not kb_name,
         "start_at": start_at,
-        "stop_after": stop_after,
-        "architecture_direction": direction.strip(),
         "iteration": 0,
         "history": [],
         "agent_models": agent_models,
@@ -965,6 +1315,7 @@ def _start_new_run(
     st.session_state.awaiting_approval = False      # is a human decision pending?
     st.session_state.awaiting_jira = False          # is Jira permission pending?
     st.session_state.awaiting_kb = False            # is the "save knowledge base?" answer pending?
+    st.session_state.awaiting_confluence = False    # is the "publish to Confluence?" answer pending?
     st.session_state.finished = False
     st.session_state.error = None
 
@@ -976,16 +1327,12 @@ if submitted and not st.session_state.get("run_active"):
         st.warning("Enter a requirement.")
         st.stop()
 
-    start_at, stop_after = START_OPTIONS[start_choice], STOP_OPTIONS[stop_choice]
-    if STAGE_ORDER.index(stop_after) < STAGE_ORDER.index(start_at):
-        st.warning(f"“Stop after: {stop_choice}” comes before “Start with: {start_choice}” — there would be nothing to run.")
-        st.stop()
+    start_at = START_OPTIONS[start_choice]
 
     st.divider()
-    _start_new_run(requirement_text, human_in_the_loop, agent_model_choices, selected_kb,
-                   start_at, stop_after, architecture_direction)
-    if start_at != "requirement" or stop_after != "release":
-        st.caption(f"Runs: **{start_choice}** → **{stop_choice}**.")
+    _start_new_run(requirement_text, human_in_the_loop, agent_model_choices, selected_kb, start_at)
+    if start_at != "requirement":
+        st.caption(f"Starts with: **{start_choice}**.")
     st.caption(
         f"Knowledge base: **{selected_kb}**" if selected_kb
         else "Knowledge base: **none — creating something new** (you'll be asked at the end whether to save it)."
@@ -997,8 +1344,92 @@ if submitted and not st.session_state.get("run_active"):
         st.caption(f"Model overrides for this run: {overrides}. Everything else: `{config.MODEL_ID}`.")
 
 
+# ---- Saved sessions: carry on where an earlier session stopped ----
+def _autosave() -> None:
+    # Keep the current session's snapshot on disk, so it can be reopened later (see session_store.py).
+    session_store.save(st.session_state)
+
+
+def _resume_session(run_id: str) -> None:
+    # Put a saved session back on the page. Runs as a button callback, before the page is redrawn.
+    restored = session_store.restore(run_id, lambda name: kb_loader.load_all(kb_loader.kb_path(name)))
+    if restored is None:
+        st.session_state["_resume_error"] = f"Session {run_id} could not be opened (its file is missing or damaged)."
+        return
+    for key in [k for k in st.session_state.keys() if isinstance(k, str) and session_store.is_session_key(k)]:
+        del st.session_state[key]                      # nothing of the session on screen may leak into the opened one
+    st.session_state.update(restored["session"])
+    st.session_state.pipeline_state = restored["pipeline_state"]
+    st.session_state.completed_events = restored["completed_events"]
+    for flag in ("awaiting_approval", "awaiting_jira", "awaiting_kb", "awaiting_confluence", "finished"):
+        st.session_state.setdefault(flag, False)
+    st.session_state.setdefault("error", None)
+    st.session_state["_resume_error"] = None
+    st.session_state["_resumed_run"] = run_id
+
+
+def _ask_delete_session(run_id: str) -> None:
+    st.session_state["_confirm_delete"] = run_id
+
+
+def _delete_session(run_id: str) -> None:
+    session_store.delete(run_id)
+    st.session_state["_confirm_delete"] = None
+
+
+def _cancel_delete_session() -> None:
+    st.session_state["_confirm_delete"] = None
+
+
+def _session_status(item: dict) -> str:
+    # Where a saved session stands, in plain words.
+    if item["error"]:
+        return "Stopped with an error"
+    if item["finished"]:
+        return "Finished"
+    where = NODE_DISPLAY.get(item["current_node"], item["current_node"] or "")
+    waiting = item["waiting"]
+    if "approval" in waiting:
+        return "Waiting for your decision"
+    if waiting:
+        return "Waiting for your answer: " + {"jira": "Jira", "kb": "knowledge base", "confluence": "Confluence"}[waiting[0]]
+    return f"In progress — continues at {where}" if where else "In progress"
+
+
+_saved = [s for s in session_store.list_sessions() if s["run_id"] != st.session_state.get("run_id")]
+if _saved:
+    with st.expander(f"🕘 Saved sessions ({len(_saved)})", expanded=False):
+        st.caption("Every session is saved as you go. Open one to carry on exactly where you left off — "
+                   "what you have already done is not run again.")
+        for item in _saved[:15]:
+            left, open_col, delete_col = st.columns([5, 1, 1], vertical_alignment="center")
+            left.markdown(f"**{item['title']}**  \n"
+                          f"{_session_status(item)} · saved {item['saved_at'].replace('T', ' ')[:16]} UTC")
+            open_col.button("Open", key=f"resume_{item['run_id']}", on_click=_resume_session, args=(item["run_id"],),
+                            use_container_width=True)
+            if st.session_state.get("_confirm_delete") == item["run_id"]:
+                delete_col.button("Confirm", key=f"confirm_delete_{item['run_id']}", type="primary",
+                                  on_click=_delete_session, args=(item["run_id"],), use_container_width=True)
+                st.caption("Delete this saved session? Its documents stay; only the saved place is forgotten.")
+                st.button("Keep it", key=f"keep_{item['run_id']}", on_click=_cancel_delete_session)
+            else:
+                delete_col.button("Delete", key=f"delete_{item['run_id']}", on_click=_ask_delete_session,
+                                  args=(item["run_id"],), use_container_width=True)
+if st.session_state.get("_resume_error"):
+    st.error(st.session_state["_resume_error"])
+if st.session_state.pop("_resumed_run", None) == st.session_state.get("run_id"):
+    st.success("Session reopened. Carry on from where you left off.")
+
 # Everything below draws the run's progress. It executes on every Streamlit
 # re-run, so it first redraws what has already finished, then continues.
+# The requirement editor (if it is on screen this run) sets these; start each run clean.
+st.session_state["_pending_requirement_edit"] = None
+st.session_state["_requirement_edit_invalid"] = False
+st.session_state["_pending_design_edits"] = None
+st.session_state["_design_edit_invalid"] = False
+st.session_state["_pending_quality_edit"] = None
+st.session_state["_quality_edit_invalid"] = False
+
 if st.session_state.get("run_started"):
     st.divider()
 
@@ -1029,12 +1460,21 @@ if st.session_state.get("run_started"):
             # approval gate right below it (which IS always visible)
             # looks like the only thing the agent produced.
             is_pending = i == last_index and st.session_state.awaiting_approval
+            # The requirement can be reworded only while nothing has been built from it: at its
+            # pause, when it is the very last thing that ran.
+            at_pause = i == last_index and st.session_state.awaiting_approval
+            can_edit = at_pause and (
+                (node_name == "requirement" and not node_result.get("requirement_skipped")
+                 and not st.session_state.pipeline_state.get("design"))
+                or (node_name == "design" and not st.session_state.pipeline_state.get("release_plan"))
+                or (node_name == "quality_planning" and not st.session_state.pipeline_state.get("release_plan"))
+            )
             with st.status(
                 stage_label(node_name, node_result, seen_counts[node_name]),
                 state=stage_state(node_name, node_result),
                 expanded=is_pending,
             ):
-                render_stage_body(node_name, node_result)
+                render_stage_body(node_name, node_result, editable=can_edit, edit_id=i + 1)
 
     # Update the progress bar to the most recently finished stage.
     if st.session_state.completed_events:
@@ -1050,6 +1490,7 @@ if st.session_state.get("run_started"):
         and not st.session_state.awaiting_approval
         and not st.session_state.get("awaiting_jira")
         and not st.session_state.get("awaiting_kb")
+        and not st.session_state.get("awaiting_confluence")
     ):
         while True:
             current_node = st.session_state.current_node
@@ -1069,7 +1510,18 @@ if st.session_state.get("run_started"):
                 st.session_state.awaiting_jira = True
                 break
 
-            # The very last step: offer to save the knowledge-base documents the
+            # Publishing the design to Confluence: ask first (and let the person reword it).
+            design_now = st.session_state.pipeline_state.get("design") or {}
+            if (
+                current_node == "confluence_publish"
+                and confluence_client.is_configured()
+                and design_now.get("change_required") and design_now.get("components")
+                and st.session_state.pipeline_state.get("confluence_approved") is None
+            ):
+                st.session_state.awaiting_confluence = True
+                break
+
+            # The knowledge-base question: offer to save the knowledge-base documents the
             # design proposed. Stop and ask first; nothing is written without a yes.
             if (
                 current_node == "kb_save"
@@ -1120,7 +1572,14 @@ if st.session_state.get("run_started"):
                         state=stage_state(current_node, result),
                         expanded=about_to_gate,
                     )
-                    render_stage_body(current_node, result)
+                    render_stage_body(
+                        current_node, result,
+                        editable=about_to_gate and (
+                            (current_node == "requirement" and not result.get("requirement_skipped"))
+                            or current_node in ("design", "quality_planning")
+                        ),
+                        edit_id=len(st.session_state.completed_events),
+                    )
 
             # Refresh the progress bar and sidebar.
             with pipeline_strip.container():
@@ -1130,12 +1589,17 @@ if st.session_state.get("run_started"):
             # Human-approval mode: pause here and wait for the person.
             if _is_gated(current_node):
                 st.session_state.awaiting_approval = True
+                _autosave()
                 break
 
             # Otherwise work out the next stage (using the real routing
             # rules from graph.py) and loop around.
             predict_fn = NEXT_NODE_FN.get(current_node)
             st.session_state.current_node = predict_fn(st.session_state.pipeline_state) if predict_fn else None
+            _autosave()
+
+    # Wherever the loop stopped (a pause, the end, an error), keep the session on disk.
+    _autosave()
 
     # ------------------------------------------------
     # Approval gate.
@@ -1157,6 +1621,34 @@ if st.session_state.get("run_started"):
         gate_n = len(st.session_state.completed_events)
         no_preference = "No preference — proceed with the agent's recommendation"
 
+        # Frozen: the document is shown above with its downloads; the person may also publish a frozen
+        # design to Confluence, then continues to the next agent.
+        if pending_name in FREEZE and stage_is_frozen(pending_name):
+            frozen_key = f"{pending_name}_frozen_at"
+            _, what, next_agent = FREEZE[pending_name]
+            state_now = st.session_state.pipeline_state
+            with st.container(border=True):
+                st.markdown(f":material/lock: **{what} frozen** — download the document above if you want it"
+                            + (", publish it to Confluence" if pending_name == "design" else "")
+                            + f", then continue to the {next_agent} agent.")
+                if pending_name == "design":
+                    render_freeze_confluence(state_now, gate_n)
+                go_col, back_col = st.columns(2)
+                if back_col.button("Unfreeze & keep editing", key=f"unfreeze_{gate_n}", use_container_width=True):
+                    st.session_state[frozen_key] = None
+                    st.rerun()
+                if go_col.button(f"Continue to {next_agent}", key=f"continue_{pending_name}_{gate_n}", type="primary",
+                                 use_container_width=True):
+                    st.session_state[frozen_key] = None
+                    if pending_name == "design" and state_now.get("confluence_approved") is None:
+                        # The choice was offered here, so the end of the run does not ask again.
+                        state_now["confluence_approved"] = False
+                    st.session_state.awaiting_approval = False
+                    predict_fn = NEXT_NODE_FN.get(pending_name)
+                    st.session_state.current_node = predict_fn(state_now) if predict_fn else None
+                    st.rerun()
+            st.stop()
+
         with st.container(border=True):
             # ---- Optional chat with the Discussion Assistant ----
             chat_key = f"chat_history_{gate_n}"
@@ -1166,17 +1658,9 @@ if st.session_state.get("run_started"):
             with st.expander(
                 "💬 Discuss before deciding", expanded=bool(st.session_state[chat_key])
             ):
-                st.caption(
-                    "Ask why it made a call, poke at a trade-off, or just think "
-                    "out loud -- this is just a conversation and doesn't change "
-                    "the plan. Use Answer or Override below once you've decided "
-                    "what you actually want."
-                )
-                chat_box = st.container(height=320)
-                with chat_box:
-                    for msg in st.session_state[chat_key]:
-                        with st.chat_message(msg["role"]):
-                            st.write(msg["content"])
+                for msg in st.session_state[chat_key]:
+                    with st.chat_message(msg["role"]):
+                        st.write(msg["content"])
 
                 # When the person sends a message: store it, ask the
                 # assistant for a reply, store that, and redraw the page.
@@ -1227,45 +1711,43 @@ if st.session_state.get("run_started"):
                 )
                 answers = {}
 
-            # BETWEEN the Requirement and Design agents: the person may make
-            # architectural changes here - direction the Design agent must follow.
-            show_direction = (
-                pending_name == "requirement"
-                and st.session_state.pipeline_state.get("stop_after") != "requirement"
-            )
-            direction_value = ""
-            if show_direction:
-                direction_value = st.text_area(
-                    "Architectural changes for the Design agent (optional)",
-                    value=st.session_state.pipeline_state.get("architecture_direction", ""),
-                    key=f"arch_direction_{gate_n}",
-                    height=90,
-                    help=(
-                        "Your own decisions about HOW to design this, applied before the Design agent "
-                        "runs: technology choices, services to reuse, things to avoid. It treats them as binding."
-                    ),
-                    placeholder="e.g. Use the existing event bus; no new databases.",
-                )
-
             # Free-text box for any extra suggestion.
             note = st.text_area(
-                "Additional notes (optional)",
+                "Tell the Design agent what to change (optional)" if pending_name == "design" else "Chat",
                 key=f"note_{gate_n}",
-                height=80,
+                height=100 if pending_name == "design" else 80,
+                placeholder=("e.g. Put a message queue between the order service and the email service instead of direct "
+                             "calls; add a cache in front of the catalogue." if pending_name == "design" else None),
+                help=("The Design agent redoes the whole design following your instructions, and you review it again. "
+                      "Any wording edits you made are replaced." if pending_name == "design" else None),
             )
 
             # The two main buttons: Approve, or Answer (send feedback back).
             gate_col1, gate_col2 = st.columns(2)
-            approve_clicked = gate_col1.button(
-                "Approve & continue",
+            # Approving is blocked while reworded requirement text is invalid (empty title,
+            # scope or criteria), so a broken requirement can never reach the Design agent.
+            edit_blocks_approval = (
+                (pending_name == "requirement" and st.session_state.get("_requirement_edit_invalid"))
+                or (pending_name == "design" and st.session_state.get("_design_edit_invalid"))
+                or (pending_name == "quality_planning" and st.session_state.get("_quality_edit_invalid"))
+            )
+            if edit_blocks_approval:
+                st.warning("Fix the problem in “Edit the test plan” above before freezing."
+                           if pending_name == "quality_planning" else
+                           "Fix the problem in “Edit the wording of …” above before approving."
+                           if pending_name == "requirement" else
+                           "Fix the problem in “Edit the wording of the design document” above before approving.")
+            suggest_clicked = gate_col1.button(
+                "Revise the design" if pending_name == "design" else "Reconsider",
+                key=f"suggest_{gate_n}",
+                use_container_width=True,
+            )
+            approve_clicked = gate_col2.button(
+                FREEZE[pending_name][0] if pending_name in FREEZE else "Approve & continue",
                 key=f"approve_{gate_n}",
                 type="primary",
                 use_container_width=True,
-            )
-            suggest_clicked = gate_col2.button(
-                "Answer & continue",
-                key=f"suggest_{gate_n}",
-                use_container_width=True,
+                disabled=bool(edit_blocks_approval),
             )
 
             # ---- Override: send the run to a different stage ----
@@ -1283,7 +1765,7 @@ if st.session_state.get("run_started"):
                     "-- skip ahead, send it back to an earlier stage, or re-run this "
                     "one with fresh direction. The target agent runs with whatever "
                     "state already exists; picking one whose inputs haven't been "
-                    "produced yet (e.g. Release Planning before Design has ever run) "
+                    "produced yet (e.g. Engineering Manager before Design has ever run) "
                     "will error out the run."
                 )
                 override_target = st.selectbox(
@@ -1308,13 +1790,21 @@ if st.session_state.get("run_started"):
                     use_container_width=True,
                 )
 
-        # Keep whatever architectural direction was typed, whichever button was pressed.
-        if show_direction and (approve_clicked or suggest_clicked or override_clicked):
-            st.session_state.pipeline_state["architecture_direction"] = direction_value.strip()
-
         # ---- What happens when each button is clicked ----
         # APPROVE: stop waiting and move on to the normal next stage.
         if approve_clicked:
+            # Save any rewording of the requirement first, so what the Design agent reads is
+            # exactly what the person approved.
+            if pending_name == "requirement" and st.session_state.get("_pending_requirement_edit"):
+                _apply_requirement_edit(st.session_state["_pending_requirement_edit"])
+            if pending_name == "design" and st.session_state.get("_pending_design_edits"):
+                _apply_design_edits(st.session_state["_pending_design_edits"])
+            if pending_name == "quality_planning" and st.session_state.get("_pending_quality_edit"):
+                _apply_quality_edit(st.session_state["_pending_quality_edit"])
+            if pending_name in FREEZE:
+                # Freezing makes the document; the person then downloads it (and may publish it) and continues.
+                st.session_state[f"{pending_name}_frozen_at"] = len(st.session_state.completed_events)
+                st.rerun()
             st.session_state.awaiting_approval = False
             predict_fn = NEXT_NODE_FN.get(pending_name)
             st.session_state.current_node = (
@@ -1333,11 +1823,14 @@ if st.session_state.get("run_started"):
             # Nothing was entered -> remind the person what to do.
             if not combined_note:
                 st.warning(
-                    "Answer at least one question or add a suggestion, or click "
-                    "Approve to continue as-is."
+                    ("Describe what the Design agent should change, or click Approve to continue as-is."
+                     if pending_name == "design" else
+                     "Answer at least one question or add a suggestion, or click Approve to continue as-is.")
                 )
             else:
                 st.session_state.awaiting_approval = False
+                if pending_name == "design":
+                    st.session_state.pipeline_state.update({"confluence_approved": None, "confluence_result": {}})
                 st.session_state.pipeline_state["pending_human_note"] = {
                     "stage": pending_name,
                     "note": combined_note,
@@ -1584,6 +2077,47 @@ if st.session_state.get("run_started"):
             st.rerun()
 
     # ------------------------------------------------
+    # Confluence gate.
+    # The last question: publish the design document to Confluence, with its diagrams? The
+    # person can reword the document first. "Skip" publishes nothing (the document stays
+    # downloadable). Wording changes are saved either way.
+    # ------------------------------------------------
+    if st.session_state.get("awaiting_confluence"):
+        cf_state = st.session_state.pipeline_state
+        cf_design, cf_req = cf_state["design"], cf_state.get("requirement") or {}
+        cf_gate_id = len(st.session_state.completed_events)
+        _, page_title = design_doc.effective(cf_design, cf_req, cf_state.get("design_doc_edits"))
+        cf = confluence_client.preview(page_title, len(design_doc.attachment_names(cf_design)))
+
+        with st.container(border=True):
+            st.markdown(":material/description: **Publish the design to Confluence?**")
+            st.write(
+                f"**Confluence:** {cf['base_url']} · space **{cf['space_key']}**"
+                + (f" · under page {cf['parent_page_id']}" if cf["parent_page_id"] else "")
+                + f"  \n**Created as:** {cf['account']}"
+            )
+            st.write(f"**Page title:** {page_title}  ·  {cf['attachments']} diagram(s) will be attached")
+            st.caption(
+                "The document is shown above, under Design. Reword it here if you like; nothing is sent until "
+                "you press Publish. If a page with this title already exists in the space, it is never overwritten."
+            )
+            render_design_wording_editor(cf_design, cf_req, cf_gate_id)
+            cf_invalid = st.session_state.get("_design_edit_invalid")
+            if cf_invalid:
+                st.warning("Fix the problem in “Edit the wording of the design document” above to publish.")
+            cf_col1, cf_col2 = st.columns(2)
+            cf_publish = cf_col1.button("Publish to Confluence", key=f"cf_publish_{cf_gate_id}", type="primary",
+                                        use_container_width=True, disabled=bool(cf_invalid))
+            cf_skip = cf_col2.button("Skip — don't publish", key=f"cf_skip_{cf_gate_id}", use_container_width=True)
+
+        if cf_publish or cf_skip:
+            if st.session_state.get("_pending_design_edits") and not cf_invalid:
+                _apply_design_edits(st.session_state["_pending_design_edits"])
+            st.session_state.pipeline_state["confluence_approved"] = bool(cf_publish)
+            st.session_state.awaiting_confluence = False
+            st.rerun()
+
+    # ------------------------------------------------
     # Final result, once finished or errored.
     # ------------------------------------------------
     if st.session_state.finished or st.session_state.error:
@@ -1608,8 +2142,7 @@ if st.session_state.get("run_started"):
                 outcome = final_state.get("run_outcome", "UNKNOWN")
                 icon = (
                     ":material/check_circle:"
-                    if outcome in {"RELEASED_TO_JIRA", "APPROVED_RELEASED", "NO_CHANGE_REQUIRED",
-                               "DESIGN_ONLY", "REQUIREMENT_ONLY"}
+                    if outcome in {"RELEASED_TO_JIRA", "APPROVED_RELEASED", "NO_CHANGE_REQUIRED"}
                     else ":material/warning:"
                 )
                 st.markdown(f"{icon} **{_humanize_outcome(outcome)}**")
@@ -1631,5 +2164,16 @@ if st.session_state.get("run_started"):
                             for n, r in st.session_state.completed_events
                         ]
                         st.rerun()
+
+            if not st.session_state.error and (final_state.get("confluence_result") or {}).get("status") == "failed":
+                if st.button("Retry publishing to Confluence", key="confluence_retry"):
+                    with st.spinner("Publishing to Confluence…"):
+                        update = graph.confluence_publish_node({**final_state, "confluence_approved": True})
+                    final_state.update(update)
+                    st.session_state.completed_events = [
+                        (n, {**r, "confluence_result": final_state["confluence_result"]}) if n == "confluence_publish" else (n, r)
+                        for n, r in st.session_state.completed_events
+                    ]
+                    st.rerun()
 
             st.caption(f"Run artifacts: `{run_dir}`")

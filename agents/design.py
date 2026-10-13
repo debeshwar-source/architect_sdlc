@@ -5,6 +5,8 @@ requirement and decides how to build it:
   - Is any change needed at all?
   - Which existing applications must change, and in what order?
   - Are brand-new applications required?
+  - Exactly WHAT has to be made (every service, UI, database, queue, job and outside
+    system involved) and how all of it is connected: the architecture itself.
   - How will it be tested, and what could go wrong?
 
 The knowledge base (descriptions of the existing applications) is OPTIONAL.
@@ -41,11 +43,25 @@ REQUIRED_KEYS = [
     "new_applications_needed",
     "cross_service_contracts",
     "dependency_order",
+    "overview",
+    "components",
+    "connections",
+    "flows",
     "test_strategy",
     "architecture_risks",
     "knowledge_base_updates",
     "clarifying_questions",
 ]
+
+# What a "component" (a thing that is built, changed, used or depended on) can be, and
+# what state it is in. These drive how it is drawn and how it is checked.
+COMPONENT_KINDS = {"service", "client", "gateway", "database", "messaging", "cache", "job", "library", "external"}
+COMPONENT_STATUSES = {"new", "changed", "existing", "external"}
+# Components of these kinds are APPLICATIONS (they get a knowledge-base document and
+# Jira stories); the others (a database, a queue...) belong to an application.
+APPLICATION_KINDS = {"service", "client", "gateway"}
+CONNECTION_KINDS = {"sync_api", "async_event", "data_access", "batch", "ui_call"}
+FLOW_STEP_KINDS = {"call", "async", "return"}
 
 # The only two things a knowledge-base update may do.
 VALID_KB_ACTIONS = {"create", "augment"}
@@ -106,6 +122,7 @@ Return ONLY valid JSON matching the contract in your skill.
 
     # Double-check the AI's answer makes logical sense (see _validate).
     _validate(result, application_names(applications))
+    _clean_architecture(result)
     _clean_kb_updates(result)
     validate_clarifying_questions(result, "Design Agent")
     return result
@@ -156,6 +173,139 @@ def _validate(result: Dict[str, Any], known_apps: List[str]) -> None:
             f"affected_applications/new_applications_needed: "
             f"{order_names - all_names}"
         )
+
+    if result["change_required"]:
+        _validate_architecture(result, known_apps, affected_names, new_names)
+
+
+def _text(value: Any) -> str:
+    return " ".join(str(value if value is not None else "").split())
+
+
+def _validate_architecture(result: Dict[str, Any], known_apps: List[str],
+                           affected_names: set, new_names: set) -> None:
+    """The components / connections / flows must be complete and consistent with the rest
+    of the plan, so the diagrams and the document built from them can be trusted. Every
+    message here is shown to the AI if it has to correct itself, so each says what to fix."""
+    if not _text(result.get("overview")):
+        raise ValueError("overview is empty: write a short plain-language description of the architecture.")
+
+    components = result.get("components")
+    if not isinstance(components, list) or not components:
+        raise ValueError("components is empty: list every service, UI, database, queue, job and outside "
+                         "system that is built, changed or used.")
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for c in components:
+        if not isinstance(c, dict) or not _text(c.get("name")):
+            raise ValueError("every component needs a name.")
+        name = _text(c["name"])
+        if name in by_name:
+            raise ValueError(f"component {name!r} is listed twice.")
+        if c.get("kind") not in COMPONENT_KINDS:
+            raise ValueError(f"component {name!r} has kind {c.get('kind')!r}; it must be one of {sorted(COMPONENT_KINDS)}.")
+        if c.get("status") not in COMPONENT_STATUSES:
+            raise ValueError(f"component {name!r} has status {c.get('status')!r}; it must be one of {sorted(COMPONENT_STATUSES)}.")
+        if not _text(c.get("responsibility")):
+            raise ValueError(f"component {name!r} has no responsibility: say what it is for.")
+        by_name[name] = c
+
+    for name, c in by_name.items():
+        app_like = c["kind"] in APPLICATION_KINDS
+        if c["status"] == "changed" and name not in affected_names:
+            raise ValueError(f"component {name!r} is marked changed but is not in affected_applications.")
+        if c["status"] == "new" and app_like and name not in new_names:
+            raise ValueError(f"component {name!r} is a new application but is not in new_applications_needed.")
+        if c["status"] == "existing" and app_like and name not in known_apps:
+            raise ValueError(f"component {name!r} is marked existing but is not a known application "
+                             f"(mark it external, or new if it has to be built).")
+    for name in sorted(affected_names):
+        if name not in by_name or by_name[name]["status"] != "changed":
+            raise ValueError(f"affected application {name!r} must appear in components with status changed.")
+    for name in sorted(new_names):
+        if name not in by_name or by_name[name]["status"] != "new":
+            raise ValueError(f"new application {name!r} must appear in components with status new.")
+
+    connections = result.get("connections")
+    if not isinstance(connections, list):
+        raise ValueError("connections must be a list.")
+    linked = set()
+    for conn in connections:
+        if not isinstance(conn, dict):
+            raise ValueError("every connection must be an object.")
+        a, b = _text(conn.get("from")), _text(conn.get("to"))
+        if a not in by_name or b not in by_name:
+            raise ValueError(f"connection {a!r} -> {b!r} names a component that is not in components.")
+        if a == b:
+            raise ValueError(f"connection {a!r} -> {b!r} joins a component to itself.")
+        if not _text(conn.get("label")):
+            raise ValueError(f"connection {a!r} -> {b!r} needs a label saying what passes along it.")
+        if conn.get("kind") not in (None, "") and conn["kind"] not in CONNECTION_KINDS:
+            raise ValueError(f"connection {a!r} -> {b!r} has kind {conn['kind']!r}; it must be one of {sorted(CONNECTION_KINDS)}.")
+        linked.update((a, b))
+    if len(by_name) >= 2 and not connections:
+        raise ValueError("components are listed but connections is empty: show how they are connected.")
+    for name, c in by_name.items():
+        if len(by_name) >= 2 and name not in linked and c["kind"] != "library":
+            raise ValueError(f"component {name!r} has no connection to anything; connect it, or leave it out.")
+
+    flows = result.get("flows")
+    if not isinstance(flows, list):
+        raise ValueError("flows must be a list (it may be empty).")
+    for flow in flows:
+        if not isinstance(flow, dict) or not _text(flow.get("name")):
+            raise ValueError("every flow needs a name.")
+        steps = flow.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ValueError(f"flow {flow.get('name')!r} has no steps.")
+        for step in steps:
+            if not isinstance(step, dict) or _text(step.get("from")) not in by_name or _text(step.get("to")) not in by_name:
+                raise ValueError(f"flow {flow['name']!r} has a step that names a component not in components.")
+            if not _text(step.get("message")):
+                raise ValueError(f"flow {flow['name']!r} has a step with no message.")
+            if step.get("kind") not in (None, "") and step["kind"] not in FLOW_STEP_KINDS:
+                raise ValueError(f"flow {flow['name']!r} has a step of kind {step['kind']!r}; use one of {sorted(FLOW_STEP_KINDS)}.")
+
+
+def _clean_architecture(result: Dict[str, Any]) -> None:
+    """Tidy the architecture in place (the checks above have passed): trim text, fill in
+    optional fields, and give each connection a status. With no change required there is
+    nothing to draw, so the lists are emptied."""
+    result["overview"] = _text(result.get("overview"))
+    if not result.get("change_required"):
+        result["components"], result["connections"], result["flows"] = [], [], []
+        return
+
+    def lines(value) -> List[str]:
+        items = value if isinstance(value, list) else ([value] if value else [])
+        return [t for t in (_text(i) for i in items) if t]
+
+    components = []
+    for c in result["components"]:
+        components.append({
+            "name": _text(c["name"]), "kind": c["kind"], "status": c["status"],
+            "responsibility": _text(c["responsibility"]), "technology": _text(c.get("technology")),
+            "interfaces": lines(c.get("interfaces")), "data_owned": lines(c.get("data_owned")),
+        })
+    status_of = {c["name"]: c["status"] for c in components}
+    connections = []
+    for conn in result["connections"]:
+        a, b = _text(conn["from"]), _text(conn["to"])
+        default = ("new" if "new" in (status_of[a], status_of[b])
+                   else "changed" if "changed" in (status_of[a], status_of[b]) else "existing")
+        connections.append({
+            "from": a, "to": b, "kind": conn.get("kind") or "sync_api",
+            "protocol": _text(conn.get("protocol")), "label": _text(conn["label"]),
+            "description": _text(conn.get("description")), "contract": _text(conn.get("contract")),
+            "status": conn.get("status") if conn.get("status") in ("new", "changed", "existing") else default,
+        })
+    flows = []
+    for flow in result["flows"]:
+        flows.append({
+            "name": _text(flow["name"]), "description": _text(flow.get("description")),
+            "steps": [{"from": _text(s["from"]), "to": _text(s["to"]), "message": _text(s["message"]),
+                       "kind": s.get("kind") or "call"} for s in flow["steps"]],
+        })
+    result["components"], result["connections"], result["flows"] = components, connections, flows
 
 
 def _clean_kb_updates(result: Dict[str, Any]) -> None:

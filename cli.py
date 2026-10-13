@@ -69,6 +69,67 @@ def _parse_agent_model_overrides(pairs: list) -> dict:
     return overrides
 
 
+def _save_requirement_docs(run_id: str, requirement: dict, choice: str, kb_name: str) -> None:
+    """Write the requirement as a Word document and/or PDF into the run's folder."""
+    from tools import requirement_doc
+    run_dir = config.RUNS_ROOT / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    meta = {"run_id": run_id, "knowledge_base": kb_name}
+    for fmt in (["docx", "pdf"] if choice == "both" else [choice]):
+        try:
+            data, file_name, _ = requirement_doc.build(requirement, meta, fmt)
+        except requirement_doc.MissingLibrary as exc:
+            print(f"    could not make the {fmt}: {exc}")
+            continue
+        (run_dir / file_name).write_bytes(data)
+        print(f"    requirement document: {run_dir / file_name}")
+
+
+def _save_design_docs(run_id: str, requirement: dict, design: dict, choice: str, kb_name: str) -> None:
+    """Write the design (components, connections, diagrams) as a Word document and/or PDF into the run's folder."""
+    from tools import design_doc
+    run_dir = config.RUNS_ROOT / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    meta = {"run_id": run_id, "knowledge_base": kb_name}
+    for fmt in (["docx", "pdf"] if choice == "both" else [choice]):
+        try:
+            data, file_name, _ = design_doc.build(requirement, design, meta, None, fmt)
+        except design_doc.MissingLibrary as exc:
+            print(f"    could not make the {fmt}: {exc}")
+            continue
+        (run_dir / file_name).write_bytes(data)
+        print(f"    design document: {run_dir / file_name}")
+
+
+def _save_test_plan(run_id: str, requirement: dict, plan: dict) -> None:
+    """Write the test plan as an Excel workbook into the run's folder."""
+    from tools import test_plan_doc
+    run_dir = config.RUNS_ROOT / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        data, file_name, _ = test_plan_doc.build(requirement, plan, {"run_id": run_id})
+    except test_plan_doc.MissingLibrary as exc:
+        print(f"    could not make the test plan: {exc}")
+        return
+    (run_dir / file_name).write_bytes(data)
+    print(f"    test plan: {run_dir / file_name}")
+
+
+def _ask_to_publish_to_confluence(preview: dict) -> bool:
+    """Called by the pipeline near the end when Confluence is set up. Shows where the design page would go
+    and asks. A non-interactive run counts as no, so nothing is ever published unasked."""
+    print("\n" + "-" * 70)
+    print("PUBLISH THE DESIGN TO CONFLUENCE?")
+    print("-" * 70)
+    print(f"  {preview['base_url']}  space {preview['space_key']}"
+          + (f"  under page {preview['parent_page_id']}" if preview["parent_page_id"] else ""))
+    print(f"  page: {preview['title']}  ({preview['attachments']} diagram(s) attached)")
+    if not sys.stdin.isatty():
+        print("  Not an interactive terminal, so nothing will be published.")
+        return False
+    return input("  Publish? [y/N] ").strip().lower() in ("y", "yes")
+
+
 def _ask_to_save_knowledge_base(preview: dict):
     """Called by the pipeline at the very end, when the Design agent proposed
     knowledge-base documents. Shows them and asks whether to save. Returns the
@@ -211,11 +272,24 @@ def _print_node_update(node_name: str, node_result: dict) -> None:
         new_apps = design.get("new_applications_needed", [])
         if new_apps:
             print(f"    new applications proposed: {[a['name'] for a in new_apps]}")
+        comps = design.get("components", [])
+        if comps:
+            print(f"    components ({len(comps)}): " + ", ".join(f"{c['name']} [{c['status']}]" for c in comps))
+        for c in design.get("connections", []):
+            print(f"      {c['from']} -> {c['to']}: {c['label']}")
         if design.get("dependency_order"):
             print(f"    dependency order: {design['dependency_order']}")
         for u in design.get("knowledge_base_updates", []):
             print(f"    knowledge base ({u['action']}): {u['application']}")
         _print_clarifying_questions(design)
+
+    elif node_name == "quality_planning":
+        plan = node_result.get("quality_plan", {})
+        cases = plan.get("test_cases", [])
+        print(f"    test cases: {len(cases)}")
+        for c in cases:
+            print(f"      {c.get('id')} [{c.get('priority')}] {c.get('type')}: {c.get('title')}")
+        _print_clarifying_questions(plan)
 
     elif node_name == "release_planning":
         plan = node_result.get("release_plan", {})
@@ -279,9 +353,24 @@ def main() -> int:
     """Run the program. Returns 0 on success, 1 on failure (the standard
     way command-line programs report success/failure)."""
     # ---- 1. Define the command-line options the user may type ----
-    parser = argparse.ArgumentParser(description="SDLC planning orchestrator: Requirement -> Design -> Release")
+    parser = argparse.ArgumentParser(description="SDLC planning orchestrator: Requirement -> Design -> Quality -> Release")
     parser.add_argument(
         "--requirement", help="Requirement text, or @path/to/file"
+    )
+    parser.add_argument(
+        "--requirement-doc",
+        choices=["docx", "pdf", "both"],
+        help="Also save the requirement as a Word document, a PDF, or both, in the run's folder.",
+    )
+    parser.add_argument(
+        "--design-doc",
+        choices=["docx", "pdf", "both"],
+        help="Also save the design (components, connections, diagrams) as a Word document, a PDF, or both, in the run's folder.",
+    )
+    parser.add_argument(
+        "--test-plan",
+        action="store_true",
+        help="Also save the Quality Planner's test cases as an Excel workbook in the run's folder.",
     )
     parser.add_argument(
         "--start-at",
@@ -427,6 +516,7 @@ def main() -> int:
         "architecture_direction": _load_requirement(args.direction).strip() if args.direction else "",
         "jira_confirm": _ask_to_create_in_jira,
         "kb_confirm": _ask_to_save_knowledge_base,
+        "confluence_confirm": _ask_to_publish_to_confluence,
         "iteration": 0,
         "history": [],
         "agent_models": agent_models,
@@ -445,6 +535,12 @@ def main() -> int:
             node_result = event[node_name]     # what that stage produced
             final_state.update(node_result)
             _print_node_update(node_name, node_result)
+            if node_name == "requirement" and args.requirement_doc and not node_result.get("requirement_skipped"):
+                _save_requirement_docs(run_id, node_result["requirement"], args.requirement_doc, kb_name)
+            if node_name == "quality_planning" and args.test_plan:
+                _save_test_plan(run_id, final_state.get("requirement") or {}, node_result["quality_plan"])
+            if node_name == "design" and args.design_doc and node_result.get("design", {}).get("change_required"):
+                _save_design_docs(run_id, final_state.get("requirement") or {}, node_result["design"], args.design_doc, kb_name)
     except Exception as e:
         # Something failed: say so, save whatever was completed, exit with error.
         print(f"\nPIPELINE ERROR: {e}", file=sys.stderr)

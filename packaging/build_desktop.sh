@@ -24,6 +24,7 @@ fi
   --collect-all streamlit --copy-metadata streamlit \
   --collect-all claude_agent_sdk --copy-metadata claude-agent-sdk \
   --collect-all langgraph --collect-all langgraph_checkpoint --collect-all langchain_core \
+  --collect-all docx --collect-all reportlab --collect-all openpyxl \
   --collect-submodules agents --collect-submodules hive --collect-submodules tools \
   --collect-submodules orchestrator --collect-submodules knowledge_base \
   --add-data "$PWD/streamlit_app.py:." \

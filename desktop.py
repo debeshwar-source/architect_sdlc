@@ -293,6 +293,9 @@ def run(args: argparse.Namespace) -> int:
     # browser, never into this window; local file access is off.
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
     webview.settings["ALLOW_FILE_URLS"] = False
+    # Download buttons (the requirement / design Word and PDF files) must SAVE the file via a
+    # save dialog. Without this the window navigates to the file itself and cannot get back.
+    webview.settings["ALLOW_DOWNLOADS"] = True
 
     window = webview.create_window(APP_NAME, html=SPLASH_HTML, width=1280, height=860, min_size=(900, 600))
 
@@ -328,20 +331,73 @@ def self_test(with_ai: bool = False) -> int:
 
     def pipeline_imports():
         # Importing these also tells the packager which modules to include.
-        import agents.design, agents.release, agents.requirement, agents.discuss      # noqa: F401
+        import agents.design, agents.quality, agents.release, agents.requirement, agents.discuss  # noqa: F401
         import config, llm, run_log                                                   # noqa: F401
         import hive.blackboard, hive.events, hive.memory                              # noqa: F401
         import knowledge_base.loader, orchestrator.graph                              # noqa: F401
-        import tools.issue_tracker, tools.jira_client                                 # noqa: F401
+        import tools.issue_tracker, tools.jira_client, tools.requirement_doc          # noqa: F401
+        import tools.design_doc, tools.diagrams, tools.confluence_client, tools.fonts  # noqa: F401
+        import tools.test_plan_doc                                                    # noqa: F401
         return "all pipeline modules import"
 
     def bundled_files():
         needed = ["streamlit_app.py", ".streamlit/config.toml"] + [
-            f"skills/{n}.md" for n in ("requirement", "design", "release", "discuss")]
+            f"skills/{n}.md" for n in ("requirement", "design", "quality", "release", "discuss")]
         missing = [n for n in needed if not (root / n).is_file()]
         if missing:
             raise FileNotFoundError("missing: " + ", ".join(missing))
         return f"{len(needed)} files present"
+
+    def requirement_documents():
+        # Make a real Word file and a real PDF, so a missing library or font shows up here.
+        import zipfile
+        from io import BytesIO
+        from tools import requirement_doc
+        sample = {"title": "Self-test", "business_goal": "Check export", "scope_summary": "Scope",
+                  "acceptance_criteria": ["It works."], "out_of_scope": [], "clarifying_questions": []}
+        docx = requirement_doc.build(sample, {}, "docx")[0]
+        if "word/document.xml" not in zipfile.ZipFile(BytesIO(docx)).namelist():
+            raise RuntimeError("the .docx is not a valid Word file")
+        pdf = requirement_doc.build(sample, {}, "pdf")[0]
+        if not pdf.startswith(b"%PDF") or b"%%EOF" not in pdf[-1024:]:
+            raise RuntimeError("the PDF is not valid")
+        return f"Word ({len(docx)} bytes) and PDF ({len(pdf)} bytes) were made"
+
+    def test_plan_workbook():
+        # Make a real Excel workbook, so a missing library shows up here.
+        import zipfile
+        from io import BytesIO
+        from tools import test_plan_doc
+        plan = {"summary": "Self-test", "test_cases": [{
+            "id": "TC-001", "title": "It works", "requirement_refs": ["AC-1"], "component": "App", "type": "Functional",
+            "priority": "High", "preconditions": "", "steps": ["Open it"], "test_data": "", "expected_result": "It opens"}]}
+        data = test_plan_doc.build({"title": "Self-test", "acceptance_criteria": ["It works."]}, plan, {})[0]
+        if "xl/workbook.xml" not in zipfile.ZipFile(BytesIO(data)).namelist():
+            raise RuntimeError("the .xlsx is not a valid Excel file")
+        return f"Excel workbook ({len(data)} bytes) was made"
+
+    def design_documents():
+        # Draw the diagrams and make the design Word file and PDF, so a missing library shows up here.
+        import zipfile
+        from io import BytesIO
+        from tools import design_doc, diagrams
+        comps = [{"name": "Web App", "kind": "client", "status": "new", "responsibility": "UI"},
+                 {"name": "Orders API", "kind": "service", "status": "new", "responsibility": "Orders"},
+                 {"name": "Orders DB", "kind": "database", "status": "new", "responsibility": "Storage"}]
+        conns = [{"from": "Web App", "to": "Orders API", "label": "places order", "kind": "http", "status": "new"},
+                 {"from": "Orders API", "to": "Orders DB", "label": "reads/writes", "kind": "db", "status": "new"}]
+        png = diagrams.architecture_diagram(comps, conns, "Self-test")
+        if not png.startswith(b"\x89PNG"):
+            raise RuntimeError("the diagram is not a PNG")
+        design = {"change_required": True, "overview": "Self-test", "components": comps, "connections": conns,
+                  "flows": [], "affected_applications": [], "new_applications_needed": [], "dependency_order": []}
+        docx = design_doc.build({"title": "Self-test"}, design, {}, None, "docx")[0]
+        if "word/document.xml" not in zipfile.ZipFile(BytesIO(docx)).namelist():
+            raise RuntimeError("the design .docx is not a valid Word file")
+        pdf = design_doc.build({"title": "Self-test"}, design, {}, None, "pdf")[0]
+        if not pdf.startswith(b"%PDF"):
+            raise RuntimeError("the design PDF is not valid")
+        return f"diagram, Word ({len(docx)} bytes) and PDF ({len(pdf)} bytes) were made"
 
     def claude_cli():
         import claude_agent_sdk
@@ -378,6 +434,9 @@ def self_test(with_ai: bool = False) -> int:
 
     check("pipeline modules", pipeline_imports)
     check("bundled app files", bundled_files)
+    check("requirement documents", requirement_documents)
+    check("test plan workbook", test_plan_workbook)
+    check("design documents", design_documents)
     check("bundled Claude CLI", claude_cli)
     check("data folder", data_folder)
     check("server start-up", server_starts)

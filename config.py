@@ -71,13 +71,13 @@ AVAILABLE_MODELS = [
     "claude-fable-5-1",
 ]
 
-# The 3 agents whose model is independently choosable, keyed by the
+# The agents whose model is independently choosable, keyed by the
 # same name each agents/<name>.py module is named after ("release"
 # here is agents/release.py, invoked from the "release_planning" node).
 #
-# Plain words: the three "specialist workers" in the pipeline
-# (Requirement -> Design -> Release). Each one can be given its own AI model.
-AGENT_NAMES = ["requirement", "design", "release"]
+# Plain words: the "specialist workers" in the pipeline
+# (Requirement -> Design -> Quality Planner -> Release). Each one can be given its own AI model.
+AGENT_NAMES = ["requirement", "design", "quality", "release"]
 
 # ---- Folder locations ------------------------------------------------
 # ROOT is the folder this file lives in, i.e. the project's top folder.

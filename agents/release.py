@@ -1,6 +1,7 @@
-"""Release Agent -- the final stage: the Jira epic, stories, tasks and subtasks.
+"""Engineering Manager Agent (module name: release) -- the final stage: the Jira epic, stories, tasks and subtasks.
 
-Plain words: once the design is settled, this agent turns it into a
+Plain words: once the design and the test plan are settled, this agent acts as the
+engineering manager. It looks at what changes in each service and turns that into a
 ready-to-file Jira backlog:
 
     Epic            the whole initiative
@@ -39,6 +40,7 @@ def run(
     revision_feedback: Dict[str, Any] = None,
     model: Optional[str] = None,
     context_notes: str = "",
+    quality_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # Applications that must each be covered by at least one story: those
     # being changed plus any brand-new ones.
@@ -49,6 +51,14 @@ def run(
     # The proposed knowledge-base documents can be long and are not needed
     # to plan tickets, so leave them out of this agent's view of the design.
     design_for_prompt = {k: v for k, v in design.items() if k != "knowledge_base_updates"}
+
+    # The test plan, in short: the engineering work for each service should account for it.
+    test_cases = [
+        {k: c.get(k) for k in ("id", "title", "component", "type", "priority", "requirement_refs")}
+        for c in (quality_plan or {}).get("test_cases", [])
+    ]
+    test_plan_text = format_dict({"summary": (quality_plan or {}).get("summary", ""), "test_cases": test_cases}) \
+        if test_cases else "(no test plan was made)"
 
     # Message to the AI: requirement, the design (build order is final),
     # and the list of applications the backlog must cover.
@@ -65,6 +75,12 @@ DESIGN (dependency_order is authoritative -- do not reorder)
 ============================================================
 
 {format_dict(design_for_prompt)}
+
+============================================================
+TEST PLAN (test cases the tickets must make room for, per service)
+============================================================
+
+{test_plan_text}
 
 ============================================================
 APPLICATIONS THE BACKLOG MUST COVER

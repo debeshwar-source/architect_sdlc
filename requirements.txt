@@ -2,3 +2,7 @@ claude-agent-sdk
 langgraph
 streamlit
 requests
+python-docx   # Word export of the requirement document
+reportlab     # PDF export of the requirement document
+pillow        # draws the architecture diagrams
+openpyxl      # Excel export of the test plan

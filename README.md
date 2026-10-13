@@ -5,14 +5,15 @@ The Streamlit UI in this package is branded **Blueprint** on screen
 throughout since that's what you actually `cd` into and import.
 
 Turns a plain-language requirement into a **design** and a ready-to-file
-**Jira backlog** using three agents, driven by **Claude Code itself** (via
+**Jira backlog** using four agents, driven by **Claude Code itself** (via
 the Claude Agent SDK). No `ANTHROPIC_API_KEY` or AWS credentials required:
 it authenticates exactly like an interactive Claude Code session.
 
 ```
-Requirement  →  Design  →  Release  →  (you approve)  →  Jira
-                  │           └─ epic → stories → tasks → subtasks,
-                  │              staged rollout plan, monitoring plan
+Requirement  →  Design  →  Quality Planner  →  Eng. Manager  →  (you approve)  →  Jira
+                  │              │                 └─ epic → stories → tasks → subtasks,
+                  │              │                    staged rollout plan, monitoring plan
+                  │              └─ plain-English test cases, saved as an Excel workbook
                   └─ which applications change / are new, in what order,
                      test strategy, risks, and knowledge-base changes
 ```
@@ -21,39 +22,89 @@ Requirement  →  Design  →  Release  →  (you approve)  →  Jira
 |---|---|
 | **Requirement** | Turns the raw request into a title, business goal, scope, acceptance criteria and exclusions. |
 | **Design** | Decides what to build: affected and new applications, dependency order, contracts, test strategy, risks -- and what to add to the knowledge base. |
-| **Release** | Writes the Jira epic with **stories, tasks and subtasks**, plus the rollout and monitoring plan. |
+| **Quality Planner** | Writes the test cases (in plain English, not unit tests) that prove each acceptance criterion and the design's flows. Freeze the plan to download it as an **Excel workbook** (Summary, Test Cases with a Status column, and Coverage sheets). On the command line, add `--test-plan`. |
+| **Engineering Manager** | Looks at what changes in each service and writes the Jira epic with **stories, tasks and subtasks**, plus the rollout and monitoring plan. |
 
 If the Design agent decides nothing needs to change, the run ends there
 (`NO_CHANGE_REQUIRED`) and no Jira backlog is written.
 
-## Choosing which agents run, and steering the design
+## Saved sessions
 
-You decide how much of the pipeline runs:
+Every session is saved as you go (to `runs/<run id>/session.json`, or the app's data
+folder in the desktop app). If the app is closed -- or crashes -- open it again and
+choose **🕘 Saved sessions → Open** to carry on exactly where you stopped: the stages
+already done, what you froze, your chats, and the question the app was waiting on.
+Reopening reads the snapshot only; no agent is run again. A stage that was still
+running when the app closed is simply run again when you reopen the session.
 
-- **Start with** the Requirement agent (normal), or the **Design agent** -- the
-  Requirement agent is skipped and your text is used as the requirement exactly as
-  written (nothing is added or interpreted). Handy when the text is already precise.
-- **Stop after** the Requirement agent (you just get the structured requirement),
-  the Design agent (you get the design, and are still offered its knowledge-base
-  documents, but no release plan or Jira backlog), or **Release** (everything).
+## The requirement as a document
 
-**Architectural changes in between** -- you can give the Design agent your own
-architectural direction (technology choices, services to reuse, things to avoid)
-and it treats it as binding:
+The Requirement agent's output is shown as a proper document -- title, scope, acceptance
+criteria (numbered AC-1, AC-2...), what is out of scope, and any open questions with the
+recommended answer marked. (The agent's business goal still goes to the later agents, but
+is deliberately left off the document.) Under it, **pick the format you prefer**:
 
-- type it in the form (*Architectural direction*) before you start, or
-- in **Human approval** mode, enter it at the pause after the Requirement agent,
-  once you have seen the requirement. (If you start at the Design agent there is
-  nothing to review at that point, so the run goes straight to the design.)
+- **Download Word document (.docx)** -- opens in Word, and in Google Docs if you upload it
+  to Drive.
+- **Download PDF.**
 
-The direction goes to the Design agent only. If it conflicts with the requirement
-or the knowledge base, the agent follows it and records the conflict under its
-risks. It also shows on the sidebar whiteboard, and changing it replaces the
-earlier version rather than stacking. After the design you can still ask the Design
-agent to revise (the *Answer* box), as before.
+**Rewording it** -- open *Edit the wording of this requirement* under the document to change
+the title, scope, acceptance criteria and out-of-scope list (one item per line). Press *Save
+wording changes* to update the document at once, or just press *Approve & continue*, which
+saves them first. The Design agent and everything after it then work from your wording, and
+the Word and PDF downloads use it too. A title, a scope and at least one acceptance criterion
+are required, and approving is blocked until they are. Using *Answer & continue* instead
+has the agent rewrite the requirement, which replaces your edits.
 
-From the command line: `--start-at design`, `--stop-after requirement|design|release`,
-and `--direction "..."` (or `@file`).
+Editing is offered only while nothing has been built from the requirement: at the pause after
+the Requirement agent, which means **Human approval mode**. In a full unattended run the design
+is made straight away, so choose Human approval if you want to change the wording first.
+
+The files are made on your computer; no account, credential or internet connection is
+involved. On the command line, `--requirement-doc docx|pdf|both` saves them into the run's
+folder. If you start at the Design agent there is no agent-written requirement, so no
+document is offered.
+
+Notes: the Word file can hold any text. The PDF uses a built-in font that covers English
+and accented Latin text; a character it lacks is replaced by a readable stand-in (`->` for
+an arrow, `Rs.` for the rupee sign, `[x]` for a tick) or `?`, so for text in another script
+(Hindi, Chinese...) use the Word version. If `python-docx` or `reportlab` is not installed
+the app still runs and tells you what to install (`pip install -r requirements.txt`).
+
+## Where the run starts, and steering the design
+
+**Start with** (on the form) -- the Requirement agent (normal), or the **Design agent**: the
+Requirement agent is skipped and your text is used as the requirement exactly as written
+(nothing is added or interpreted). Handy when the text is already precise.
+
+**Architectural changes in between** -- in **Human approval** mode, the pause after the
+Requirement agent has an *Architectural changes for the Design agent* box. Whatever you
+type there (technology choices, services to reuse, things to avoid) is binding for the
+Design agent. If it conflicts with the requirement or the knowledge base, the agent follows
+it and records the conflict under its risks. It also shows on the sidebar whiteboard, and
+changing it replaces the earlier version rather than stacking. (If you start at the Design
+agent there is nothing to review at that point, so the run goes straight to the design.)
+After the design you can still ask the Design agent to revise (the *Answer* box), as before.
+
+The command line has a few extras the form does not: `--start-at design`,
+`--stop-after requirement|design|release` (end the run early), and `--direction "..."` (or
+`@file`) to give the Design agent architectural direction up front.
+
+## The design as a document, and publishing to Confluence
+
+The Design agent now spells out the exact **components** to build or change (services, clients, gateways, queues,
+databases, external systems), the **connections** between them (who calls whom, and why), and the key **flows**.
+The result is shown as a document with diagrams: an architecture map, a sequence-style diagram per flow, and a
+build-order diagram, plus tables for components, interfaces, a who-talks-to-whom matrix, risks and tests.
+
+- **Change the words:** at the design pause (and again before publishing) open "Edit the wording of the design
+  document", change any text, and save. Your wording is used everywhere: on screen, in downloads, in Confluence.
+- **Change the design:** at the design pause type instructions in "Tell the Design agent what to change" and press
+  **Revise the design**. The agent redoes the design and you review it again.
+- **Download:** Word or PDF, no credentials needed (CLI: `--design-doc docx|pdf|both`).
+- **Publish to Confluence:** at the end you are asked first. It uses your Jira site, email and token; the only
+  extra setting is `CONFLUENCE_SPACE_KEY` (optionally `CONFLUENCE_PARENT_PAGE_ID`). An existing page with the same
+  title is never overwritten, and a failed publish can be retried without duplicating anything.
 
 ## Knowledge bases
 
@@ -236,7 +287,7 @@ python3 cli.py --requirement "Notify users by email and push when a \
 # or from a file
 python3 cli.py --requirement @requirement.txt
 
-# choose a model per agent (requirement, design, release)
+# choose a model per agent (requirement, design, quality, release)
 python3 cli.py --requirement @requirement.txt --agent-model design=claude-opus-5-5
 
 # pick a knowledge base, or create something new
@@ -351,6 +402,8 @@ microservices forming a small, coherent OTT streaming platform
 ```bash
 python3 test_hive.py       # the pipeline
 python3 test_desktop.py    # the desktop launcher (starts a real local server)
+python3 test_documents.py  # the Word / PDF requirement document
+python3 test_ui.py         # the web app end to end: Jira, knowledge bases, scope, document
 ```
 
 No AI or network needed: covers memory, the knowledge-base create/augment
@@ -373,6 +426,7 @@ knowledge_base/loader.py        lists, reads, creates and appends to knowledge b
 knowledge_base/<name>/            one folder per knowledge base (demo: streamly/)
 hive/                           events, blackboard, cross-run memory
 tools/issue_tracker.py          local mock Jira
+tools/requirement_doc.py        the requirement as a document: screen, Word, PDF
 tools/jira_client.py            real Jira over REST (only after approval)
 orchestrator/graph.py           LangGraph wiring
 cli.py, streamlit_app.py        entry points
