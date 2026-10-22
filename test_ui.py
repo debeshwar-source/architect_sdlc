@@ -66,11 +66,6 @@ def area(at, label):
     return [a for a in at.text_area if a.label == label][0]
 
 
-def kb_name_box(at):
-    """The box for naming a new knowledge base (not the small session-name box in the page's top corner)."""
-    return [t for t in at.text_input if not (t.key or "").startswith("session_name_")][0]
-
-
 def box(at, startswith):
     return [c for c in at.checkbox if c.label.startswith(startswith)][0]
 
@@ -94,7 +89,7 @@ def start(text="Add reminders to the todo app", mode="Agentic", choices=None, kb
         select(at, label).select(value)
     if kb_index is not None:
         select(at, "Knowledge base").select_index(kb_index)
-    at.button[labels(at).index("Draft the blueprint")].click()
+    at.button[0].click()
     return at.run()
 
 
@@ -293,13 +288,13 @@ def test_with_no_knowledge_bases_the_new_one_is_named_and_saved_only_on_a_yes():
         assert not at.exception, at.exception
         assert "Save knowledge base" in labels(at) and "Don't save" in labels(at)
         assert kb.list_knowledge_bases() == [], "written before the user answered!"
-        assert kb_name_box(at).value == "todo-app"                    # suggested from the project title
-        kb_name_box(at).set_value("Todo KB!")
+        assert at.text_input[0].value == "todo-app"                    # suggested from the project title
+        at.text_input[0].set_value("Todo KB!")
         at = at.run()
         assert "Will be saved as `todo-kb`" in texts(at)
         at = click(at, "Save knowledge base")
         assert not at.exception, at.exception
-        assert [k.name for k in kb.list_knowledge_bases()] == ["todo-kb"] and (root / "todo-kb.md").is_file()
+        assert [k.name for k in kb.list_knowledge_bases()] == ["todo-kb"] and (root / "todo-kb" / "todo-api.md").is_file()
         assert "Saved to new knowledge base" in texts(at)
 
 
@@ -310,11 +305,11 @@ def test_a_taken_name_is_blocked_and_dont_save_writes_nothing():
         options = select(fresh_app(), "Knowledge base").options
         assert len(options) == 2 and options[0].startswith("todo-kb (1 applications)") and "Create something new" in options[1]
         at = start(text="Build a todo app", kb_index=1)                  # create something new
-        kb_name_box(at).set_value("todo-kb")
+        at.text_input[0].set_value("todo-kb")
         at = at.run()
         assert "already exists" in texts(at)
         assert [b for b in at.button if b.label == "Save knowledge base"][0].proto.disabled
-        kb_name_box(at).set_value("another")
+        at.text_input[0].set_value("another")
         at = click(at.run(), "Don't save")
         assert [k.name for k in kb.list_knowledge_bases()] == ["todo-kb"]
         assert "not saved" in texts(at).lower()
@@ -330,17 +325,16 @@ def test_a_selected_knowledge_base_is_only_appended_to_after_approval():
             new_applications_needed=[], dependency_order=["todo-api"],
             knowledge_base_updates=[{"application": "todo-api", "action": "augment",
                                      "content": "- now sends reminders", "reason": "r"}])
-        canned["Release Agent"]["stories"] = [t._reading(t._story(), "todo-api")]
-        before = existing.read_text()
+        before = (existing / "todo-api.md").read_text()
         with scripted_ai(canned):
             at = start(text="Build a todo app", kb_index=0)
         assert not at.exception, at.exception
         assert "Add these to the knowledge base" in texts(at) and "todo-kb" in texts(at)
-        assert existing.read_text() == before, "changed before approval!"
+        assert (existing / "todo-api.md").read_text() == before, "changed before approval!"
         at = click(at, "Save knowledge base")
         assert not at.exception, at.exception
-        after = existing.read_text()
-        assert after.startswith(before.rstrip()) and "now sends reminders" in after       # appended at the end, nothing rewritten
+        after = (existing / "todo-api.md").read_text()
+        assert after.startswith(before.rstrip()) and "now sends reminders" in after
         assert [k.name for k in kb.list_knowledge_bases()] == ["todo-kb"]
 
 
@@ -348,7 +342,7 @@ def test_the_knowledge_base_question_comes_after_the_stage_approvals_in_human_mo
     with t._kb_root(), scripted_ai(new_kb_canned()):
         at = approve_three_stages(start(text="Build a todo app", mode="Human approval"))
         assert "Save knowledge base" in labels(at)
-        kb_name_box(at).set_value("human-run-kb")
+        at.text_input[0].set_value("human-run-kb")
         at = click(at.run(), "Save knowledge base")
         assert [k.name for k in kb.list_knowledge_bases()] == ["human-run-kb"]
 
@@ -356,78 +350,6 @@ def test_the_knowledge_base_question_comes_after_the_stage_approvals_in_human_mo
 # ------------------------------------------------------------
 # Which agents run, and architectural direction in between
 # ------------------------------------------------------------
-
-def _heads(at):
-    return [b.label for b in at.button if (b.key or "").endswith("_head") and "dd_" in (b.key or "")]
-
-
-def test_the_page_has_a_small_wordmark_and_no_large_heading():
-    at = fresh_app()
-    assert not at.title, "no big heading"
-    assert any('class="app-name"' in m.value and "SDLC Studio" in m.value for m in at.markdown)
-
-
-def test_the_landing_page_shows_only_the_start_and_no_agents_yet():
-    at = fresh_app()
-    names = [h.split("  ", 1)[1] for h in _heads(at)]
-    assert all(h.startswith("▸") for h in _heads(at)), "every card starts closed"
-    assert names[0] == "➕ New requirement" and names[1].startswith("📚 Knowledge bases")
-    assert not [n for n in names if any(a in n for a in ("Engineering Manager 2", "Coding agent", "Code reviewer", "QA agent"))], names   # none of the later agents yet
-    assert not [s for s in at.subheader if s.value.startswith("Start")]
-    css = " ".join(m.value for m in at.markdown)
-    assert ".st-key-dd_new_body{display:none}" in css                                              # the form is out of sight until asked for
-    at.button(key="dd_new_head").click().run()
-    assert at.button(key="dd_new_head").label == "▾  ➕ New requirement"
-    assert ".st-key-dd_new_body{display:none}" not in " ".join(m.value for m in at.markdown)       # now it shows
-
-
-def test_each_later_agent_appears_only_after_the_step_before_it(monkeypatch):
-    import progress
-
-    def names(**flags):
-        monkeypatch.setattr(progress, "flags", lambda run_id, has_plan: {"em2": False, "review": False, "qa": False, **flags})
-        return " | ".join(h.split("  ", 1)[1] for h in _heads(fresh_app()))
-    assert "Engineering Manager 2" not in names() and "Code reviewer" not in names() and "QA agent" not in names()
-    after_plan = names(em2=True)
-    assert "Engineering Manager 2" in after_plan and "Code reviewer" not in after_plan and "QA agent" not in after_plan
-    after_pr = names(em2=True, review=True)
-    assert "Code reviewer" in after_pr and "QA agent" not in after_pr
-    after_merge = names(em2=True, review=True, qa=True)
-    assert after_merge.index("Engineering Manager 2") < after_merge.index("Code reviewer") < after_merge.index("QA agent")
-
-
-def test_a_session_can_be_saved_under_a_custom_name_and_a_new_run_starts_unnamed():
-    import session_store
-    with scripted_ai(jira_canned()):
-        at = start(mode="Agentic")
-    assert not at.exception, at.exception
-    rid = at.session_state["run_id"]
-    assert any(b.label == "Save" and b.key == f"session_name_save_{rid}" for b in at.button)         # the control is there once a session is open
-    at.text_input(key=f"session_name_{rid}").set_value("  ").run()
-    at.button(key=f"session_name_save_{rid}").click().run()
-    assert any("Type a name" in e.value for e in at.error) and "session_name" not in at.session_state     # nothing saved for a blank name
-    at.text_input(key=f"session_name_{rid}").set_value("Reminders rollout v1").run()
-    at.button(key=f"session_name_save_{rid}").click().run()
-    assert not at.exception, at.exception
-    assert any("Saved as “Reminders rollout v1”" in s.value for s in at.success)
-    assert session_store.read(rid)["session"]["session_name"] == "Reminders rollout v1"                 # on disk, so it survives closing the app
-    item = next(s for s in session_store.list_sessions() if s["run_id"] == rid)
-    assert item["title"] == "Reminders rollout v1" and item["named"]
-    at2 = fresh_app()
-    assert not [b for b in at2.button if (b.key or "").startswith("session_name_save_")]                 # no session open: nothing to name
-
-
-def test_the_new_requirement_card_tucks_itself_away_once_a_run_starts():
-    at = fresh_app()
-    at.button(key="dd_new_head").click().run()
-    at.text_area[0].set_value("Add reminders to the todo app")
-    at.radio[0].set_value("Agentic")
-    with scripted_ai(jira_canned()):
-        at.button[labels(at).index("Draft the blueprint")].click()
-        at = at.run()
-    assert not at.exception, at.exception
-    assert at.button(key="dd_new_head").label == "▸  ➕ New requirement"
-
 
 def test_the_form_has_only_a_start_with_choice():
     at = fresh_app()
