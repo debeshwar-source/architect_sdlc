@@ -63,12 +63,15 @@ def run(
     # applications (for context), any reviewer feedback, the exact JSON
     # shape we want back, and finally the user's requirement itself.
     # (The doubled braces {{ }} just print a literal { } inside an f-string.)
+    # This stage only needs to know WHAT exists (name and purpose), so it gets the one-line-per-application
+    # overview; the full page is for the Design stage.
+    kb_context = format_overview_for_prompt(applications)
     prompt = f"""
 ============================================================
 KNOWN APPLICATIONS (overview only -- context, not authoritative for scope)
 ============================================================
 
-{SCRATCH_KB_NOTICE if from_scratch else format_overview_for_prompt(applications)}
+{SCRATCH_KB_NOTICE if from_scratch else kb_context}
 {format_feedback_section(revision_feedback, context_notes)}
 ============================================================
 OUTPUT
@@ -99,10 +102,9 @@ REQUIREMENT
     # answer must contain; `system` is this agent's instruction sheet
     # (skills/requirement.md); `model` optionally picks a specific AI model.
     result = llm.call_llm_json(
-        prompt,
-        "Requirement Agent",
-        required_keys=REQUIRED_KEYS,
+        prompt, "Requirement Agent",
         system=load_skill("requirement"),
+        required_keys=REQUIRED_KEYS,
         model=model,
         validate=_check,      # a bad answer is sent back for correction, not fatal
     )

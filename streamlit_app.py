@@ -23,6 +23,8 @@ import time
 
 import streamlit as st
 
+from agents import catalog
+
 import agents.discuss as discuss_agent
 import agents.quality as quality_agent
 import config
@@ -35,6 +37,9 @@ import tools.design_doc as design_doc
 import tools.jira_client as jira_client
 import tools.requirement_doc as requirement_doc
 import tools.test_plan_doc as test_plan_doc
+from ui_kit import dropdown
+import activity
+import activity_ui
 from hive import blackboard, events
 
 # Browser-tab title, icon and use the full page width.
@@ -73,7 +78,7 @@ def offer_download(column, label: str, data: bytes, file_name: str, mime: str, k
     if notice and notice[0] == key:
         column.caption(notice[1])
 
-st.set_page_config(page_title="Blueprint · Claude SDLC", page_icon="📐", layout="wide")
+st.set_page_config(page_title="SDLC Studio", page_icon="📐", layout="wide")
 
 # A little custom styling (CSS): smaller code text, a small uppercase label
 # above the title, and a bolder title.
@@ -95,47 +100,75 @@ st.markdown(
         font-weight: 700 !important;
         letter-spacing: -0.02em;
     }
+    .app-name {
+        font-size: 1.05rem;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        margin: 0 0 0.4rem 0;
+    }
+    .app-name span {
+        font-weight: 400;
+        font-size: 0.82rem;
+        color: #6B7280;
+        margin-left: 0.5rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---- Page header ----
-st.title("From requirement to rollout")
-st.markdown(
-    "Turn one requirement into a design and a ready-to-file Jira backlog — "
-    "epic, stories, tasks and subtasks — reasoned end-to-end by Claude. "
-    "Works with or without an existing knowledge base."
-)
+_top_left, _top_right = st.columns([5, 1], vertical_alignment="center")
+_top_left.markdown('<div class="app-name">📐 SDLC Studio<span>requirement → design → backlog → code → review → QA</span></div>', unsafe_allow_html=True)
 
-# The knowledge bases that exist (each folder under knowledge_base/ is one).
+
+def _save_session_as(name: str) -> str:
+    """Give the open session a name of the person's choosing and save it now. Returns '' or a reason it was refused."""
+    clean = session_store.clean_name(name)
+    if not clean:
+        return "Type a name."
+    if session_store.name_taken(clean, st.session_state.get("run_id", "")):
+        return "Another saved session already has that name."
+    st.session_state["session_name"] = clean
+    return "" if session_store.save(st.session_state) else "The session could not be saved."
+
+
+def _render_save_control() -> None:
+    """The small "Save as…" button: name the open session and save it now. Only while a session is open."""
+    if not (st.session_state.get("run_started") and st.session_state.get("run_id")):
+        return
+    with st.popover("💾 Save as…", use_container_width=True):
+        _run_key = st.session_state["run_id"]
+        _default_name = st.session_state.get("session_name") or ((st.session_state.get("pipeline_state") or {}).get("requirement") or {}).get("title", "")
+        _name = st.text_input("Session name", value=_default_name, max_chars=session_store.NAME_MAX, key=f"session_name_{_run_key}")
+        if st.button("Save", type="primary", key=f"session_name_save_{_run_key}", use_container_width=True):
+            _problem = _save_session_as(_name)
+            if _problem:
+                st.error(_problem)
+            else:
+                st.success(f"Saved as “{st.session_state['session_name']}”. Open it any time from Saved sessions.")
+
+
+_save_slot = _top_right.container()          # filled in just before the run area, once this run's state is settled
+
+
+# The knowledge bases that exist (each .md file under knowledge_base/ is one).
 # They are optional: the user can also choose "create something new".
 knowledge_bases = kb_loader.list_knowledge_bases()
 
 # The option in the knowledge-base picker that means "start something new".
 NEW_KB_LABEL = "✚ Create something new (a new knowledge base)"
 
-if knowledge_bases:
-    # A collapsible panel to read what each knowledge base contains (one tab each).
-    with st.expander(f"Knowledge bases ({len(knowledge_bases)})", expanded=False):
-        st.caption(
-            "Pick one when you start a run, or create something new. Nothing is "
-            "added to a knowledge base without your say-so at the end of the release."
-        )
-        for tab, kb in zip(st.tabs([k.name for k in knowledge_bases]), knowledge_bases):
-            with tab:
-                docs = kb_loader.load_all(kb.path)
-                if not docs:
-                    st.caption("This knowledge base is empty.")
-                for app in docs:
-                    st.markdown(f"#### {app.name}")
-                    st.markdown(app.content)
-                    st.divider()
-else:
-    st.info(
-        "No knowledge bases yet — your run will design from scratch. At the end of the "
-        "release you will be asked whether to save what it designed as a new knowledge base."
-    )
+def _knowledge_bases_body() -> None:
+    if not knowledge_bases:
+        st.info("No knowledge bases yet — your run will design from scratch, and at the end you decide whether to save it as one.")
+        return
+    for tab, kb in zip(st.tabs([k.name for k in knowledge_bases]), knowledge_bases):
+        with tab:
+            page = kb.path.read_text(encoding="utf-8").strip()
+            if not page:
+                st.caption("This knowledge base is empty.")
+            st.markdown(page)
 
 
 # Display label per agent key (config.AGENT_NAMES) -- used by the
@@ -154,16 +187,18 @@ START_OPTIONS = {"Requirement agent": "requirement", "Design agent (skip the Req
 # INPUT FORM
 # ============================================================
 
-st.subheader("Start a new run")
+def _close_new_card() -> None:
+    """Runs before the page is drawn again: the form tucks itself away while the run is shown."""
+    st.session_state["dd_new"] = False
 
-# The form groups the inputs so nothing happens until "Draft the blueprint"
-# is clicked.
-with st.container(border=True):
+
+def _new_run_form() -> dict:
+    """The new-run form. Returns everything it collected (and whether it was submitted)."""
     with st.form("run_form"):
         # Big text box for the user's request.
         requirement_text = st.text_area(
             "Requirement",
-            height=140,
+            height=110,
             help="Plain language is fine -- naming specific applications is the Design stage's job, not yours. Works for changes to existing systems and for building something from scratch.",
             placeholder=(
                 "Notify users by email and push when a new episode of a show "
@@ -246,8 +281,18 @@ with st.container(border=True):
 
         # The submit button; `submitted` is True on the run where it was clicked.
         submitted = st.form_submit_button(
-            "Draft the blueprint", type="primary", use_container_width=True
+            "Draft the blueprint", type="primary", use_container_width=True, on_click=_close_new_card
         )
+    return {"requirement_text": requirement_text, "mode": mode, "human_in_the_loop": human_in_the_loop, "selected_kb": selected_kb,
+            "start_choice": start_choice, "agent_model_choices": agent_model_choices, "submitted": submitted}
+
+
+# The page: a quiet stack of cards. Each opens only when asked, so nothing is cluttered.
+_form: dict = {}
+dropdown("➕ New requirement", "dd_new", lambda: _form.update(_new_run_form()))
+dropdown(f"📚 Knowledge bases ({len(knowledge_bases)})", "dd_kb", _knowledge_bases_body)
+requirement_text, mode, human_in_the_loop = _form["requirement_text"], _form["mode"], _form["human_in_the_loop"]
+selected_kb, start_choice, agent_model_choices, submitted = _form["selected_kb"], _form["start_choice"], _form["agent_model_choices"], _form["submitted"]
 
 
 # ============================================================
@@ -946,6 +991,9 @@ def render_story_tree(stories) -> None:
                     st.markdown(f"**{task_key + ': ' if task_key else ''}{task.get('title', '')}**")
                     if task.get("description"):
                         st.caption(task["description"])
+                    who = task.get("assignment") or {}
+                    if who:
+                        st.caption("; ".join(catalog.assignment_lines(who)[:4]))
                     for sub in task.get("subtasks", []):
                         st.write(f"- [ ] {sub.get('title', '')}")
 
@@ -1253,6 +1301,7 @@ def _run_with_live_status(status_box, base_label: str, fn, *args, **kwargs):
         elapsed = int(time.monotonic() - start)
         verb, subject = verbs[i % len(verbs)]
         status_box.update(label=f"{base_label} — {verb} {subject}… ({elapsed}s)")
+        activity.refresh_live(force=True)                 # the agent runs in a worker thread: draw its lines from here
         i += 1
 
     thread.join()
@@ -1294,6 +1343,7 @@ def _start_new_run(
     st.session_state.run_started = True
     st.session_state.run_active = True
     st.session_state.run_id = run_id
+    st.session_state.pop("session_name", None)       # a new run starts unnamed
     st.session_state.requirement_text = requirement_text
     st.session_state.human_in_the_loop = human_in_the_loop
     # The starting data handed to the first pipeline step. A chosen knowledge
@@ -1327,6 +1377,7 @@ if submitted and not st.session_state.get("run_active"):
         st.warning("Enter a requirement.")
         st.stop()
 
+    st.session_state["dd_new"] = False                    # the form tucks itself away while the run is shown
     start_at = START_OPTIONS[start_choice]
 
     st.divider()
@@ -1397,27 +1448,37 @@ def _session_status(item: dict) -> str:
 
 
 _saved = [s for s in session_store.list_sessions() if s["run_id"] != st.session_state.get("run_id")]
+def _saved_sessions_body() -> None:
+    for item in _saved[:15]:
+        left, open_col, delete_col = st.columns([5, 1, 1], vertical_alignment="center")
+        left.markdown(f"**{item['title']}**  \n"
+                      + (f"{item['original']}  \n" if item["original"] else "")
+                      + f"{_session_status(item)} · saved {item['saved_at'].replace('T', ' ')[:16]} UTC")
+        open_col.button("Open", key=f"resume_{item['run_id']}", on_click=_resume_session, args=(item["run_id"],),
+                        use_container_width=True)
+        if st.session_state.get("_confirm_delete") == item["run_id"]:
+            delete_col.button("Confirm", key=f"confirm_delete_{item['run_id']}", type="primary",
+                              on_click=_delete_session, args=(item["run_id"],), use_container_width=True)
+            st.caption("Delete this saved session? Its documents stay; only the saved place is forgotten.")
+            st.button("Keep it", key=f"keep_{item['run_id']}", on_click=_cancel_delete_session)
+        else:
+            delete_col.button("Delete", key=f"delete_{item['run_id']}", on_click=_ask_delete_session,
+                              args=(item["run_id"],), use_container_width=True)
+
+
 if _saved:
-    with st.expander(f"🕘 Saved sessions ({len(_saved)})", expanded=False):
-        st.caption("Every session is saved as you go. Open one to carry on exactly where you left off — "
-                   "what you have already done is not run again.")
-        for item in _saved[:15]:
-            left, open_col, delete_col = st.columns([5, 1, 1], vertical_alignment="center")
-            left.markdown(f"**{item['title']}**  \n"
-                          f"{_session_status(item)} · saved {item['saved_at'].replace('T', ' ')[:16]} UTC")
-            open_col.button("Open", key=f"resume_{item['run_id']}", on_click=_resume_session, args=(item["run_id"],),
-                            use_container_width=True)
-            if st.session_state.get("_confirm_delete") == item["run_id"]:
-                delete_col.button("Confirm", key=f"confirm_delete_{item['run_id']}", type="primary",
-                                  on_click=_delete_session, args=(item["run_id"],), use_container_width=True)
-                st.caption("Delete this saved session? Its documents stay; only the saved place is forgotten.")
-                st.button("Keep it", key=f"keep_{item['run_id']}", on_click=_cancel_delete_session)
-            else:
-                delete_col.button("Delete", key=f"delete_{item['run_id']}", on_click=_ask_delete_session,
-                                  args=(item["run_id"],), use_container_width=True)
+    dropdown(f"🕘 Saved sessions ({len(_saved)})", "dd_sessions", _saved_sessions_body)
+# The Activity card comes BEFORE the run area: it is drawn first so that agents working below it can write into it as they go.
+activity.detach()                                          # a new page run: last run's terminal box is gone; the card draws a fresh one if open
+dropdown("🖥️ Activity", "dd_activity", activity_ui.render, lazy=True)
+with _save_slot:
+    _render_save_control()
 if st.session_state.get("_resume_error"):
     st.error(st.session_state["_resume_error"])
-if st.session_state.pop("_resumed_run", None) == st.session_state.get("run_id"):
+# Say so only when the user has just opened a saved session. (Comparing with run_id alone is wrong on a
+# fresh start: nothing was reopened and no run exists, so both are None and None == None.)
+_just_resumed = st.session_state.pop("_resumed_run", None)
+if _just_resumed and _just_resumed == st.session_state.get("run_id"):
     st.success("Session reopened. Carry on from where you left off.")
 
 # Everything below draws the run's progress. It executes on every Streamlit
@@ -1952,6 +2013,16 @@ if st.session_state.get("run_started"):
                             "Steps inside this sub-task (one per line)",
                             value="\n".join(x["title"] for x in old_task.get("subtasks", [])), height=100,
                             key=ek(story["key"], f"T{number}", "steps")))
+                        assigned = old_task.get("assignment") or {}
+                        if assigned:                       # a person can hand the task to another agent
+                            agents_ = sorted(catalog.VALID_AGENTS)
+                            pick = st.selectbox(
+                                "Agent for this sub-task", agents_,
+                                index=agents_.index(assigned["agent"]) if assigned.get("agent") in agents_ else 0,
+                                key=ek(story["key"], f"T{number}", "agent"))
+                            if pick != assigned.get("agent"):
+                                new_task["assignment"] = {**assigned, "agent": pick, "skills": [],
+                                                          **({"reason": "Assigned by the reviewer"} if pick == catalog.NEEDS_HUMAN else {})}
 
             n_epic = int("epic" in chosen)
             n_stories = sum(1 for s_ in info["items"] if s_["key"] in chosen)
@@ -2177,3 +2248,21 @@ if st.session_state.get("run_started"):
                     st.rerun()
 
             st.caption(f"Run artifacts: `{run_dir}`")
+
+
+# ---- The later agents appear one after another, each once the step before it is done ----
+import progress as _progress
+from coding import tasks as _coding_tasks, ui as _coding_ui
+from qa import ui as _qa_ui
+from review import ui as _review_ui
+
+_plan = (st.session_state.get("pipeline_state") or {}).get("release_plan") or {}
+_rid = st.session_state.get("run_id", "")
+_show = _progress.flags(_rid, bool(st.session_state.get("run_started") and _plan.get("stories")))
+if _show["em2"]:
+    # only this session's own tasks and subtasks: nothing from any other session
+    _coding_ui.render(_progress.session_tasks(_plan, _rid), key=f"coding_{_rid}_", sidebar=False)
+if _show["review"]:
+    dropdown("🔍 Code reviewer", "dd_review", lambda: _review_ui.render(default_model=config.MODEL_ID), lazy=True)
+if _show["qa"]:
+    dropdown("🧪 QA agent", "dd_qa", lambda: _qa_ui.render(default_model=config.MODEL_ID), lazy=True)

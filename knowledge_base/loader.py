@@ -1,34 +1,26 @@
 """
-Loads the pre-existing architecture knowledge base: one .md file per
-known application/repo. Deterministic, no LLM calls.
+The architecture knowledge bases: ONE markdown file per knowledge base, named after it
+(knowledge_base/streamly.md). Deterministic, no LLM calls.
 
-Unlike ai_native_sdlc's context_layer (which live-scans a single
-cloned repo), this reads curated documents describing MANY
-applications the org already maintains -- there is no repo to clone
-at this layer, only the docs that describe the architecture.
+Plain words: each file is a crisp page describing a system. If it has an "## Applications" section whose
+bullets look like  - `name` — what it does  then each bullet is one application; otherwise the whole page
+is ONE application named after the file. The agents read the page itself; the applications list is what
+the app uses to check names (an affected application must exist or be proposed as new) and to save
+what a design adds: a new application is added to the list and gets its own section at the end of the
+page, and an existing one gets a dated update section at the end. Existing text is never rewritten.
 
-Plain words: reads the library of short documents that describe each
-existing software application (what it does, what it depends on) so the
-AI agents can read them. No AI is used here - it only reads files.
-
-There can be SEVERAL knowledge bases: each sub-folder of
-config.KNOWLEDGE_BASES_ROOT is one (e.g. knowledge_base/streamly/), holding one
-.md file per application. A run uses one chosen knowledge base, or none.
-Knowledge bases are OPTIONAL: with none (or an empty one), load_all() returns
-an empty list and the agents design from scratch.
-This module can also WRITE (create_knowledge_base / create_doc / augment_doc),
-which is how a design adds to a knowledge base or starts a new one. Writing is
-deliberately conservative: a new knowledge base never reuses an existing
-name, a new document never overwrites an existing one, and augmenting only
-ever appends. (Deciding WHETHER to write is the user's call - see
+Knowledge bases are OPTIONAL: with none, the agents design from scratch. Writing is deliberately
+conservative: a new knowledge base never reuses an existing name, a new application never overwrites an
+existing one, and augmenting only ever appends. (Deciding WHETHER to write is the user's call - see
 kb_save_node in orchestrator/graph.py.)
 """
 
 import re
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import config
 
@@ -44,6 +36,12 @@ class ApplicationDoc:
     purpose: Optional[str]      # one-line description of what it does
 
 
+@lru_cache(maxsize=None)
+def _field_pattern(label: str) -> "re.Pattern[str]":
+    # Compiled once per label (the labels are few: "Repo", "Purpose").
+    return re.compile(rf"\*\*{re.escape(label)}:\*\*\s*(.+(?:\n[ \t]+\S.*)*)")
+
+
 def _extract_field(content: str, label: str) -> Optional[str]:
     # Finds a line such as "**Purpose:** does X" in the document and
     # returns what follows the label (or None if the label is absent).
@@ -51,10 +49,7 @@ def _extract_field(content: str, label: str) -> Optional[str]:
     # Captures the field's value across wrapped continuation lines
     # (indented lines immediately following, as this KB's markdown
     # uses), stopping at the first blank line or next bullet.
-    match = re.search(
-        rf"\*\*{re.escape(label)}:\*\*\s*(.+(?:\n[ \t]+\S.*)*)",
-        content,
-    )
+    match = _field_pattern(label).search(content)
     if not match:
         return None
     # Tidy up: squash extra whitespace/newlines and strip backticks.
@@ -62,59 +57,89 @@ def _extract_field(content: str, label: str) -> Optional[str]:
     return value
 
 
-def load_all(kb_dir: Path) -> List[ApplicationDoc]:
-    """Read every .md file in ONE knowledge-base folder, one per application."""
-    # Folder missing -> no applications.
-    if not kb_dir.is_dir():
-        return []
+_APPLICATIONS_HEADING = re.compile(r"(?mi)^##\s+Applications\s*$")
+_APP_BULLET = re.compile(r"^-\s+`([^`\n]+)`\s*(?:[—–:-]+\s*)?(.*)$")
 
-    docs = []
-    # Go through the files in alphabetical order for consistent results.
-    for path in sorted(kb_dir.glob("*.md")):
-        content = path.read_text(encoding="utf-8")
-        # The application's name is the file name without ".md".
-        name = path.stem
-        docs.append(
-            ApplicationDoc(
-                name=name,
-                path=path,
-                content=content,
-                repo_url=_extract_field(content, "Repo"),
-                purpose=_extract_field(content, "Purpose"),
-            )
-        )
-    return docs
+
+def _applications_section(text: str) -> Optional[Tuple[int, int]]:
+    """(start, end) character positions of the text after the '## Applications' heading, or None."""
+    m = _APPLICATIONS_HEADING.search(text)
+    if not m:
+        return None
+    nxt = re.search(r"(?m)^##\s", text[m.end():])
+    return m.end(), (m.end() + nxt.start() if nxt else len(text))
+
+
+# Parsed pages, keyed by file and remembered while the file is unchanged (its modified time and size are the
+# check), so looking a knowledge base up several times in a run reads and parses it once.
+_PARSED: Dict[Path, Tuple[Tuple[int, int], List["ApplicationDoc"]]] = {}
+
+
+def load_all(kb_file: Path) -> List[ApplicationDoc]:
+    """The applications of ONE knowledge base (a .md file). Each bullet in its '## Applications' section is one
+    application; with no such section the whole page is one application named after the file."""
+    try:
+        st = kb_file.stat()
+    except OSError:
+        return []
+    if not kb_file.is_file():
+        return []
+    stamp = (st.st_mtime_ns, st.st_size)
+    hit = _PARSED.get(kb_file)
+    if hit and hit[0] == stamp:
+        return list(hit[1])                      # a copy: callers may reorder or filter their list
+    docs = _parse(kb_file)
+    _PARSED[kb_file] = (stamp, docs)
+    return list(docs)
+
+
+def _parse(kb_file: Path) -> List[ApplicationDoc]:
+    text = kb_file.read_text(encoding="utf-8")
+    span = _applications_section(text)
+    docs: List[ApplicationDoc] = []
+    if span:
+        current: Optional[List[str]] = None
+        for line in text[span[0]:span[1]].splitlines():
+            m = _APP_BULLET.match(line.strip()) if not line.startswith((" ", "\t")) else None
+            if m:
+                current = [m.group(1), m.group(2).strip(), line.strip()]
+                docs.append(ApplicationDoc(m.group(1), kb_file, line.strip(), None, m.group(2).strip() or None))
+            elif current and line.strip() and line.startswith((" ", "\t")):     # a wrapped continuation line
+                last = docs[-1]
+                docs[-1] = ApplicationDoc(last.name, kb_file, last.content + " " + line.strip(), None, last.purpose)
+    if docs:
+        return docs
+    first = next((ln.strip() for ln in text.splitlines()[1:] if len(ln.strip()) > 40 and not ln.startswith(("#", "-", "|", "*", "<"))), "")
+    return [ApplicationDoc(kb_file.stem, kb_file, text, _extract_field(text, "Repo"), _extract_field(text, "Purpose") or first or None)]
 
 
 # ------------------------------------------------------------
-# Finding and creating knowledge bases (the folders themselves)
+# Finding and creating knowledge bases (the files themselves)
 # ------------------------------------------------------------
 
 @dataclass
 class KnowledgeBase:
-    name: str                # the folder name, e.g. "streamly"
-    path: Path               # where it lives
-    application_count: int   # how many application documents it holds
+    name: str                # the file name without .md, e.g. "streamly"
+    path: Path               # the file
+    application_count: int   # how many applications it lists
 
 
 def list_knowledge_bases(root: Path = None) -> List[KnowledgeBase]:
-    """Every knowledge base under the root: each sub-folder is one. Hidden and
-    internal folders (starting with "." or "_", like __pycache__) are ignored.
+    """Every knowledge base under the root: each .md file is one. Files starting with "." or "_" are ignored.
     Returns an empty list if the root does not exist."""
     root = root or config.KNOWLEDGE_BASES_ROOT
     if not root.is_dir():
         return []
     return [
-        KnowledgeBase(p.name, p, len(list(p.glob("*.md"))))
-        for p in sorted(root.iterdir())
-        if p.is_dir() and not p.name.startswith((".", "_"))
+        KnowledgeBase(p.stem, p, len(load_all(p)))
+        for p in sorted(root.glob("*.md"))
+        if p.is_file() and not p.name.startswith((".", "_"))
     ]
 
 
 def kb_path(name: str, root: Path = None) -> Path:
-    """The folder of the existing knowledge base called `name`. Only names that
-    appear in list_knowledge_bases() are accepted, so a crafted name cannot
-    point anywhere else."""
+    """The file of the existing knowledge base called `name`. Only names that appear in list_knowledge_bases()
+    are accepted, so a crafted name cannot point anywhere else."""
     for kb in list_knowledge_bases(root):
         if kb.name == name:
             return kb.path
@@ -122,7 +147,7 @@ def kb_path(name: str, root: Path = None) -> Path:
 
 
 def suggest_kb_name(title: str, root: Path = None) -> str:
-    """A folder-safe knowledge base name based on a project title, made unique
+    """A file-safe knowledge base name based on a project title, made unique
     among the existing ones (adds -2, -3 ... if the name is taken)."""
     base = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:40] or "new-knowledge-base"
     taken = {kb.name for kb in list_knowledge_bases(root)}
@@ -133,62 +158,92 @@ def suggest_kb_name(title: str, root: Path = None) -> str:
 
 
 def normalise_kb_name(name: str) -> str:
-    """The folder name a typed knowledge-base name would become (lowercase
+    """The file name a typed knowledge-base name would become (lowercase
     letters, digits, hyphens). Empty if nothing usable is left."""
     return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
 
 
 def create_knowledge_base(name: str, root: Path = None) -> Path:
-    """Create a NEW, empty knowledge base. Refuses a name that is already
-    taken - a "new" knowledge base must never be merged into an old one.
-    The name is reduced to lowercase letters, digits and hyphens."""
+    """Create a NEW knowledge base: a page with an empty '## Applications' list. Refuses a name that is already
+    taken - a "new" knowledge base must never be merged into an old one. The name is reduced to lowercase
+    letters, digits and hyphens. Returns the file."""
     root = root or config.KNOWLEDGE_BASES_ROOT
-    path = root / _safe_name(name)
+    slug = _safe_name(name)
+    path = root / f"{slug}.md"
     if path.exists():
-        raise FileExistsError(f"A knowledge base named {path.name!r} already exists")
-    path.mkdir(parents=True)
+        raise FileExistsError(f"A knowledge base named {slug!r} already exists")
+    root.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"# {slug}\n\n## Applications\n\n", encoding="utf-8")
     return path
 
 
 # ------------------------------------------------------------
-# Writing documents into one knowledge base
+# Writing into one knowledge base
 # ------------------------------------------------------------
 
 def _safe_name(name: str) -> str:
-    # Turn an application name into a safe file name: lowercase letters,
-    # digits and hyphens only. This also blocks tricks like "../../etc"
-    # that would otherwise write outside the knowledge-base folder.
+    # Turn an application name into a safe name: lowercase letters, digits and hyphens only.
     slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
     if not slug:
         raise ValueError(f"Invalid application name for the knowledge base: {name!r}")
     return slug
 
 
-def create_doc(name: str, content: str, kb_dir: Path) -> Path:
-    """Create a NEW application document. Refuses to overwrite an
-    existing one (use augment_doc to add to it). Creates the folder if
-    it does not exist yet. Returns the path written."""
-    path = kb_dir / f"{_safe_name(name)}.md"
-    if path.exists():
-        raise FileExistsError(f"Knowledge base document already exists: {path.name}")
-    kb_dir.mkdir(parents=True, exist_ok=True)
-    path.write_text(content.rstrip() + "\n", encoding="utf-8")
-    return path
+def canonical_name(name: str, known: List[str]) -> Optional[str]:
+    """The spelling in `known` that `name` means, or None. Names are compared after reducing them to lowercase
+    letters, digits and hyphens, so "d2c_user", "D2C-User" and "d2c-user" are the same application."""
+    key = normalise_kb_name(name)
+    if not key:
+        return None
+    return next((k for k in known if normalise_kb_name(k) == key), None)
 
 
-def augment_doc(name: str, addition: str, run_id: str = "", kb_dir: Path = None) -> Path:
-    """Append a dated section to an EXISTING document. Existing text is
-    never changed or removed -- the addition goes at the end, labelled
-    with the run that proposed it, so it is easy to review or revert."""
-    path = kb_dir / f"{_safe_name(name)}.md"
-    if not path.is_file():
-        raise FileNotFoundError(f"Knowledge base document not found: {path.name}")
+def _purpose_of(content: str) -> str:
+    """A one-line description for the applications list: the document's **Purpose:** field, else its first sentence."""
+    field = _extract_field(content, "Purpose")
+    if field:
+        return field
+    for line in content.splitlines():
+        line = line.strip().lstrip("#>*- ").strip()
+        if len(line) > 20:
+            return line[:200]
+    return ""
+
+
+def create_doc(name: str, content: str, kb_file: Path) -> Path:
+    """Add a NEW application: a bullet in the '## Applications' list and its own section at the end of the page.
+    Refuses an application that is already listed (use augment_doc to add to it). Returns the file."""
+    slug = _safe_name(name)
+    if canonical_name(slug, [d.name for d in load_all(kb_file)]):
+        raise FileExistsError(f"Knowledge base application already exists: {slug}")
+    text = kb_file.read_text(encoding="utf-8") if kb_file.is_file() else f"# {kb_file.stem}\n"
+    bullet = f"- `{slug}` — {_purpose_of(content)}".rstrip(" —")
+    span = _applications_section(text)
+    if span is None:
+        implicit = load_all(kb_file) if kb_file.is_file() else []      # a page with no list is ONE application: keep it listed
+        lines = [f"- `{d.name}` — {d.purpose or ''}".rstrip(" —") for d in implicit] + [bullet]
+        text = text.rstrip() + "\n\n## Applications\n\n" + "\n".join(lines) + "\n"
+    else:
+        head, tail = text[:span[1]].rstrip(), text[span[1]:]
+        text = head + "\n" + bullet + "\n" + ("\n" + tail if tail.strip() else "")
+    text = text.rstrip() + f"\n\n## {slug}\n\n{content.strip()}\n"
+    kb_file.write_text(text, encoding="utf-8")
+    return kb_file
+
+
+def augment_doc(name: str, addition: str, run_id: str = "", kb_file: Path = None) -> Path:
+    """Append a dated section about an EXISTING application. Existing text is never changed or removed -- the
+    addition goes at the end, labelled with the run that proposed it, so it is easy to review or revert."""
+    slug = _safe_name(name)
+    existing = canonical_name(slug, [d.name for d in load_all(kb_file)]) if kb_file is not None else None
+    if existing is None:
+        raise FileNotFoundError(f"Knowledge base application not found: {slug}")
+    slug = existing                              # the heading uses the spelling the page already has
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     source = f", run {run_id}" if run_id else ""
-    block = f"\n\n## Update ({stamp}{source})\n\n{addition.strip()}\n"
-    with path.open("a", encoding="utf-8") as f:
-        f.write(block)
-    return path
+    with kb_file.open("a", encoding="utf-8") as f:
+        f.write(f"\n\n## Update to {slug} ({stamp}{source})\n\n{addition.strip()}\n")
+    return kb_file
 
 
 def apply_updates(
@@ -196,26 +251,25 @@ def apply_updates(
 ) -> List[dict]:
     """Apply the Design agent's `knowledge_base_updates` list. Each item:
     {"application", "action": "create" | "augment", "content", "reason"}.
-    With create_only=True (used for from-scratch builds) a document may only
-    be CREATED: if the name is already taken by an existing document, that
-    document is left untouched and the item is reported as skipped, so a
-    from-scratch design can never be appended onto an unrelated old document.
-    `kb_dir` is the ONE knowledge-base folder to write into.
+    With create_only=True (used for from-scratch builds) an application may only
+    be CREATED: if the name is already listed, it is left untouched and the item is
+    reported as skipped, so a from-scratch design can never be appended onto an unrelated one.
+    `kb_dir` is the ONE knowledge-base file to write into (the name is kept for the callers).
     Never raises for one bad item - it records the problem and carries on,
     so a single bad update cannot lose the rest. Returns one result per
     item: {"application", "action", "status": "applied" | "skipped" |
     "failed", "path" / "detail"}."""
     if kb_dir is None:
-        raise ValueError("apply_updates needs the knowledge-base folder to write into")
+        raise ValueError("apply_updates needs the knowledge-base file to write into")
     results = []
     for u in updates or []:
         name, action = u.get("application", ""), u.get("action", "")
         try:
-            exists = (kb_dir / f"{_safe_name(name)}.md").is_file()
+            exists = canonical_name(_safe_name(name), [d.name for d in load_all(kb_dir)]) is not None
             if create_only and exists:
                 results.append({
                     "application": name, "action": action, "status": "skipped",
-                    "detail": "from-scratch build: a document with this name already exists "
+                    "detail": "from-scratch build: an application with this name already exists "
                               "and was left untouched",
                 })
                 continue
@@ -286,6 +340,10 @@ def get_doc(docs: List[ApplicationDoc], name: str) -> Optional[ApplicationDoc]:
     return None
 
 
+_DEPENDS_ON = re.compile(r"## Depends on[^\n]*\n(.*?)(?=\n##|\Z)", re.DOTALL)
+_BACKTICKED = re.compile(r"`([^`\n]+)`")
+
+
 def existing_dependency_edges(docs: List[ApplicationDoc]) -> List[Tuple[str, str]]:
     """(caller, callee) edges for the architecture as it exists TODAY,
     parsed from each doc's own "## Depends on" section -- only edges
@@ -298,13 +356,25 @@ def existing_dependency_edges(docs: List[ApplicationDoc]) -> List[Tuple[str, str
     edges = []
     for doc in docs:
         # Find this document's "## Depends on" section...
-        section_match = re.search(r"## Depends on[^\n]*\n(.*?)(?=\n##|\Z)", doc.content, re.DOTALL)
+        section_match = _DEPENDS_ON.search(doc.content)
         if not section_match:
             continue
-        section = section_match.group(1)
-        # ...and note every other known application mentioned in it (in
-        # `backticks`) as something this one depends on.
-        for callee in known_names:
-            if callee != doc.name and re.search(rf"`{re.escape(callee)}`", section):
+        # ...and note every other known application mentioned in it (in `backticks`) as something
+        # this one depends on. The names are read out of the section once, then looked up.
+        for callee in dict.fromkeys(_BACKTICKED.findall(section_match.group(1))):
+            if callee != doc.name and callee in known_names:
                 edges.append((doc.name, callee))
     return edges
+
+
+def kb_page(docs: List[ApplicationDoc]) -> str:
+    """What the agents are shown of the knowledge base: the page itself (the .md file all the applications came
+    from); if the documents do not come from one file, they are printed one after another."""
+    if not docs:
+        return EMPTY_KB_NOTICE
+    paths = {d.path for d in docs}
+    if len(paths) == 1:
+        only = next(iter(paths))
+        if only.is_file() and only.suffix == ".md":
+            return only.read_text(encoding="utf-8").strip()
+    return format_full_kb_for_prompt(docs)

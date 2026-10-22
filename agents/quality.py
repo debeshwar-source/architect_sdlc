@@ -70,10 +70,9 @@ Return ONLY valid JSON matching the contract in your skill.
 """
 
     result = llm.call_llm_json(
-        prompt,
-        "Quality Planner Agent",
-        required_keys=REQUIRED_KEYS,
+        prompt, "Quality Planner Agent",
         system=load_skill("quality"),
+        required_keys=REQUIRED_KEYS,
         model=model,
         validate=lambda r: _validate(r, set(criteria)),     # a bad answer is corrected, not fatal
     )

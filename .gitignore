@@ -7,3 +7,4 @@ memory/
 build/
 dist/
 desktop.log
+.DS_Store

@@ -28,6 +28,7 @@ FILE_NAME = "session.json"
 SESSION_KEYS = (
     "run_started", "run_active", "run_id", "requirement_text", "human_in_the_loop", "current_node",
     "awaiting_approval", "awaiting_jira", "awaiting_kb", "awaiting_confluence", "finished", "error",
+    "session_name",
 )
 # ... and the families of keys: the freeze markers and the discussion chats.
 SESSION_KEY_SUFFIXES = ("_frozen_at",)
@@ -132,6 +133,20 @@ def delete(run_id: str) -> bool:
         return False
 
 
+NAME_MAX = 90
+
+
+def clean_name(name: str) -> str:
+    """A session name as it will be kept: one line, extra spaces gone, at most NAME_MAX characters."""
+    return " ".join(str(name or "").split())[:NAME_MAX]
+
+
+def name_taken(name: str, run_id: str = "") -> bool:
+    """Does another saved session (not `run_id`) already carry this name? (Case does not matter.)"""
+    wanted = clean_name(name).lower()
+    return bool(wanted) and any((s["title"].lower() == wanted) for s in list_sessions(limit=10_000) if s["run_id"] != run_id and s["named"])
+
+
 def list_sessions(limit: int = 30) -> List[Dict[str, Any]]:
     """The saved sessions, most recently saved first. Unreadable ones are skipped."""
     found = []
@@ -146,8 +161,10 @@ def list_sessions(limit: int = 30) -> List[Dict[str, Any]]:
         title = ((state.get("requirement") or {}).get("title")
                  or str(session.get("requirement_text") or "").strip().splitlines()[0:1] or [""])
         title = title if isinstance(title, str) else title[0]
+        custom = clean_name(session.get("session_name") or "")
         found.append({
-            "run_id": folder.name, "title": title[:90] or "(untitled)", "saved_at": data.get("saved_at", ""),
+            "run_id": folder.name, "title": custom or title[:90] or "(untitled)", "named": bool(custom),
+            "original": title[:90] if custom else "", "saved_at": data.get("saved_at", ""),
             "current_node": session.get("current_node"), "finished": bool(session.get("finished")),
             "error": session.get("error"),
             "waiting": [name for name in ("approval", "jira", "kb", "confluence") if session.get(f"awaiting_{name}")],

@@ -19,8 +19,8 @@ skips the Requirement agent (your text is used as the requirement, as written);
 --stop-after requirement|design ends the run early. --direction adds your own
 architectural direction for the Design agent.
 
-Knowledge bases: each folder under knowledge_base/ is one (the demo one,
-knowledge_base/streamly/, describes a fictional OTT streaming platform). Pick
+Knowledge bases: each .md file under knowledge_base/ is one (the demo one,
+knowledge_base/streamly.md, describes a fictional OTT streaming platform). Pick
 one with --kb NAME, or use --new-kb to start something new; the new knowledge
 base is only saved if you say yes at the end. See --list-kbs.
 

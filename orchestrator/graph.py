@@ -55,6 +55,8 @@ from langgraph.graph import END, START, StateGraph
 import agents.design as design_agent
 import agents.quality as quality_agent
 import agents.release as release_agent
+import token_log
+from agents import catalog
 import agents.requirement as requirement_agent
 import config
 import knowledge_base.loader as kb_loader
@@ -510,6 +512,7 @@ def release_planning_node(state: SDLCState):
         model=_model_for(state, "release"),
         context_notes=_context_for("release_planning", state),
         quality_plan=state.get("quality_plan"),
+        applications=[] if _is_scratch(state) else state["applications"],
     )
     return {
         "release_plan": release_plan,
@@ -557,7 +560,9 @@ def release_apply_node(state: SDLCState):
 
 _EPIC_TEXT = ("title", "description")
 _STORY_TEXT = ("title", "description", "acceptance_criteria")
-_TASK_TEXT = ("title", "description")
+# A task's assignment (agent, skills, knowledge-base references, output) can be changed by a
+# person on the review screen, so it is editable like the wording; it is re-checked on save.
+_TASK_TEXT = ("title", "description", "assignment")
 
 
 def _everything_but_wording(plan: dict) -> dict:
@@ -614,6 +619,19 @@ def apply_ticket_edits(state: SDLCState, edited_plan: dict) -> dict:
     changes = plan_text_changes(old, edited_plan)
     if not changes:
         return {}
+
+    # A changed assignment must still be a valid one (a listed agent that has the skills named,
+    # references that exist, an output with its checks).
+    problems = catalog.check_plan(
+        edited_plan.get("stories", []),
+        [] if _is_scratch(state) else state.get("applications") or [],
+        # plans made before assignments existed carry none, and can still have their wording edited
+        require=any("assignment" in task for s in old.get("stories", []) for task in s.get("tasks", [])))
+    if problems:
+        raise ValueError("The assignment is not valid: " + " ".join(problems[:5]))
+    for change in changes:
+        if change.endswith(".assignment"):
+            token_log.record("assignment_override", "Release Agent", task=change.split(".")[0])
 
     update: Dict[str, Any] = {"release_plan": edited_plan}
     if state.get("release_result"):
@@ -840,7 +858,7 @@ def kb_save_node(state: SDLCState):
                 run_id=state["run_id"], kb_dir=kb_dir, create_only=False,
             )
             created_new = False
-        result = {"status": "saved", "mode": preview["mode"], "kb_name": kb_dir.name,
+        result = {"status": "saved", "mode": preview["mode"], "kb_name": kb_dir.stem,
                   "path": str(kb_dir), "created_new_kb": created_new, "results": results}
     except (OSError, ValueError) as exc:
         result = {"status": "failed", "mode": preview["mode"], "error": str(exc)}

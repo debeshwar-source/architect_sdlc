@@ -13,9 +13,11 @@ It also produces a staged rollout plan (what goes live first, how to know
 it is safe to continue, how to roll back) and a monitoring plan.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import llm
+from agents import catalog
+from knowledge_base.loader import ApplicationDoc
 from agents._common import (
     format_dict,
     format_feedback_section,
@@ -41,6 +43,7 @@ def run(
     model: Optional[str] = None,
     context_notes: str = "",
     quality_plan: Optional[Dict[str, Any]] = None,
+    applications: Optional[List[ApplicationDoc]] = None,
 ) -> Dict[str, Any]:
     # Applications that must each be covered by at least one story: those
     # being changed plus any brand-new ones.
@@ -59,6 +62,13 @@ def run(
     ]
     test_plan_text = format_dict({"summary": (quality_plan or {}).get("summary", ""), "test_cases": test_cases}) \
         if test_cases else "(no test plan was made)"
+
+    # Who can take a task, and which knowledge-base documents a task may point at (names and
+    # headings only - the affected applications' documents, not the whole base).
+    applications = applications or []
+    agent_block = catalog.prompt_block()
+    kb_index = catalog.kb_index(applications, expected_names)
+    catalog.log_context(agent_block, kb_index)
 
     # Message to the AI: requirement, the design (build order is final),
     # and the list of applications the backlog must cover.
@@ -90,6 +100,18 @@ APPLICATIONS THE BACKLOG MUST COVER
 
 Every application listed above must be the `component` of at least one
 story.
+
+============================================================
+AGENTS YOU CAN ASSIGN (one per task; see "Agent Assignment" in your skill)
+============================================================
+
+{agent_block}
+
+============================================================
+KNOWLEDGE BASE INDEX (document: headings -- a task may reference only these)
+============================================================
+
+{kb_index}
 {format_feedback_section(revision_feedback, context_notes)}
 ============================================================
 OUTPUT
@@ -100,17 +122,18 @@ Return ONLY valid JSON matching the contract in your skill.
 
     # Send the prompt to the AI (instruction sheet: skills/release.md).
     result = llm.call_llm_json(
-        prompt,
-        "Release Agent",
-        required_keys=REQUIRED_KEYS,
+        prompt, "Release Agent",
         system=load_skill("release"),
+        required_keys=REQUIRED_KEYS,
         model=model,
-        validate=lambda r: _validate(r, expected_names),   # bad answer -> corrected, not fatal
+        validate=lambda r: _validate(r, expected_names, applications, True),   # bad answer -> corrected, not fatal
     )
 
     # Check the backlog is complete and consistent.
-    _validate(result, expected_names)
+    _validate(result, expected_names, applications, True)
     validate_clarifying_questions(result, "Release Agent")
+    # Counted by code, not asked of the AI: tasks per agent, and which need a person.
+    result["assignment_summary"] = catalog.summarise(result["stories"])
     return result
 
 
@@ -120,9 +143,12 @@ VALID_PRIORITIES = {"Highest", "High", "Medium", "Low", "Lowest"}
 VALID_STORY_POINTS = {1, 2, 3, 5, 8, 13}
 
 
-def _validate(result: Dict[str, Any], expected_names: set) -> None:
+def _validate(result: Dict[str, Any], expected_names: set,
+              applications: Optional[List[ApplicationDoc]] = None, require_assignment: bool = False) -> None:
     """Reject incomplete or inconsistent release plans (raises ValueError,
-    which causes the AI call to be retried)."""
+    which causes the AI call to be retried). With `require_assignment`, every task must
+    also carry a valid assignment (see agents/catalog.py); all assignment problems are
+    reported together so one retry can fix them."""
     # There must be at least one rollout stage.
     if not isinstance(result.get("rollout_stages"), list) or not result["rollout_stages"]:
         raise ValueError("Release Agent returned no rollout stages.")
@@ -194,3 +220,9 @@ def _validate(result: Dict[str, Any], expected_names: set) -> None:
                 f"Story {story['id']} has invalid blocked_by "
                 f"(unknown or self): {unknown_blockers or {story['id']}}"
             )
+
+    # Every task: which agent, which skills, which knowledge-base parts, what comes back.
+    problems = catalog.check_plan(stories, applications, require=require_assignment)
+    if problems:
+        raise ValueError("Task assignments need fixing: " + " ".join(problems[:8])
+                         + (f" (+{len(problems) - 8} more)" if len(problems) > 8 else ""))

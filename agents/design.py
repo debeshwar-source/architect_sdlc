@@ -22,6 +22,7 @@ orchestrator/graph.py - this agent only proposes them.)
 from typing import Any, Dict, List, Optional
 
 import llm
+import token_log
 from agents._common import (
     format_dict,
     format_feedback_section,
@@ -32,8 +33,17 @@ from knowledge_base.loader import (
     SCRATCH_KB_NOTICE,
     ApplicationDoc,
     application_names,
-    format_full_kb_for_prompt,
+    canonical_name,
+    kb_page,
 )
+
+# Added to the one-page knowledge base summary in one-pager mode.
+READ_RULES = """
+
+HOW TO USE THIS: the knowledge base above is a one-page summary and an index; the full documents are NOT
+included. Before you name an application as affected, or rely on its contract or data, read the relevant
+section with the `read_kb` tool (document name, section name from the index). Read only what the summary
+does not settle, at most {n} reads, and prefer sections to whole documents."""
 
 # Fields the AI's answer must contain, or the answer is rejected.
 REQUIRED_KEYS = [
@@ -86,20 +96,31 @@ def run(
     # Reviewer feedback / background notes (empty on a first attempt).
     feedback_section = format_feedback_section(revision_feedback, context_notes)
 
-    # Message to the AI: the requirement, the full knowledge base (or a
-    # note that there is none), any feedback, and the output instructions.
+    # What of the knowledge base to show: the documents relevant to this request, and inside the
+    # big ones only the relevant sections (plus the contracts/limits sections and the foundational
+    # documents). Everything else is still listed - as a heading or a one-line summary - so the AI
+    # can name it. A small knowledge base, or CLAUDE_SDLC_ARCHITECT_KB_SLICING=0, shows everything.
+    # The knowledge base is one page (knowledge_base/<name>.md), shown as it is. It comes FIRST and the
+    # requirement after it: the page is the same from run to run, so the AI service can reuse it from its
+    # cache; only what follows the first difference has to be paid for again.
+    kb_text = SCRATCH_KB_NOTICE if from_scratch else kb_page(applications)
+    # The checker compares names exactly, and an application is named after its file (e.g. "d2c_user"),
+    # not after the page's heading ("D2C-User-Data"), so the exact names are spelled out.
+    names_line = ("EXACT NAMES of existing applications (use these spellings only): "
+                  + ", ".join(application_names(applications))
+                  + ". Any other application must go in new_applications_needed.\n\n") if applications else ""
     prompt = f"""
+============================================================
+KNOWLEDGE BASE (every known application)
+============================================================
+
+{names_line}{kb_text}
+
 ============================================================
 REQUIREMENT
 ============================================================
 
 {format_dict(requirement)}
-
-============================================================
-FULL KNOWLEDGE BASE (every known application)
-============================================================
-
-{SCRATCH_KB_NOTICE if from_scratch else format_full_kb_for_prompt(applications)}
 {feedback_section}
 ============================================================
 OUTPUT
@@ -107,25 +128,54 @@ OUTPUT
 
 Return ONLY valid JSON matching the contract in your skill.
 """
+    token_log.record("kb_page", "Design Agent", applications=len(applications), kb_tokens=token_log.est_tokens(kb_text))
 
-    # Send the prompt to the AI. `required_keys` lists the fields the
-    # answer must contain; `system` is this agent's instruction sheet
-    # (skills/design.md); `model` optionally picks a specific AI model.
+    # Send the prompt to the AI. `required_keys` lists the fields the answer must contain; `system` is this
+    # agent's skill (skills/design.md); `model` optionally picks a specific AI model.
     result = llm.call_llm_json(
         prompt,
         "Design Agent",
         required_keys=REQUIRED_KEYS,
         system=load_skill("design"),
         model=model,
-        validate=lambda r: _validate(r, application_names(applications)),   # bad answer -> corrected, not fatal
+        validate=lambda r: (_use_known_spellings(r, application_names(applications)),
+                            _validate(r, application_names(applications))),   # bad answer -> corrected, not fatal
     )
 
-    # Double-check the AI's answer makes logical sense (see _validate).
+    # Use the knowledge base's own spelling for any application the AI wrote differently ("d2c-user" for
+    # "d2c_user"), then double-check the answer makes logical sense (see _validate).
+    _use_known_spellings(result, application_names(applications))
     _validate(result, application_names(applications))
     _clean_architecture(result)
     _clean_kb_updates(result)
     validate_clarifying_questions(result, "Design Agent")
     return result
+
+
+_NAME_KEYS = {"name", "application", "from", "to"}
+
+
+def _use_known_spellings(result: Any, known_apps: List[str]) -> None:
+    """Rewrite, in place, every application name in the answer that matches a known application apart from
+    spelling (case, '_' vs '-') to the known spelling, so the exact-name checks below do not reject it. Only
+    whole values under name-like keys (and the items of dependency_order) are touched, never prose."""
+    def fix(value: Any) -> Any:
+        return (canonical_name(value, known_apps) or value) if isinstance(value, str) else value
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in _NAME_KEYS:
+                    node[key] = fix(value)
+                elif key == "dependency_order" and isinstance(value, list):
+                    node[key] = [fix(v) for v in value]
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(result)
 
 
 def _validate(result: Dict[str, Any], known_apps: List[str]) -> None:

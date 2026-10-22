@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 from typing import Dict, List
 
+from agents import catalog
+
 
 def _slugify(text: str, max_length: int = 40) -> str:
     # Make text safe for file names/IDs: lowercase, only letters/digits,
@@ -112,6 +114,9 @@ def _child_md(record: dict, kind: str, children: List[dict]) -> str:
         "",
         record["description"] or "(no further detail)",
     ]
+    assignment = catalog.assignment_lines(record.get("assignment") or {})
+    if assignment:
+        lines += ["", "## Assignment", ""] + [f"- {line}" for line in assignment]
     if children:
         lines += ["", f"## Subtasks ({len(children)})", ""]
         lines += [f"- [ ] [{c['ticket_id']}]({c['ticket_id']}.md) {c['title']}" for c in children]
@@ -217,6 +222,7 @@ def write_release(
                 "component": component,
                 "status": "TO DO",
                 "subtasks": [s["ticket_id"] for s in subtask_records],
+                "assignment": task.get("assignment") or {},
             }
             task_records.append((task_record, subtask_records))
             _save(output_dir, task_record, _child_md(task_record, "Task", subtask_records))

@@ -28,6 +28,8 @@ tries again (up to 3 times in total) before giving up.
 """
 
 import asyncio
+import contextlib
+import json
 from typing import Any, Callable, Dict, List, Optional
 
 from claude_agent_sdk import (
@@ -35,10 +37,12 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
     query,
 )
 
 import config
+import token_log
 
 # How many times we try a call before giving up.
 MAX_ATTEMPTS = 3
@@ -50,6 +54,57 @@ MAX_ATTEMPTS = 3
 # ("Turns" = back-and-forth steps the AI may take while thinking about one
 # question; 6 gives it room to reason without running forever.)
 MAX_TURNS = 6
+
+# Token usage the CLI reported for the call(s) in progress (input, cached
+# input, output); read and reset by call_llm_json for the token ledger.
+_USAGE: Dict[str, int] = {}
+
+
+# What the CLI reported about the call(s) in progress besides token counts: how many turns it took,
+# how long, what it cost, and how much hidden reasoning it wrote. Read by call_llm_json for the ledger.
+_STATS: Dict[str, float] = {}
+
+
+def _note_stats(message: Any) -> None:
+    if isinstance(message, AssistantMessage):
+        for block in message.content:
+            if isinstance(block, ThinkingBlock):
+                _STATS["thinking_tokens_est"] = _STATS.get("thinking_tokens_est", 0) + (len(block.thinking) + 3) // 4
+    elif isinstance(message, ResultMessage):
+        _STATS["turns"] = _STATS.get("turns", 0) + (message.num_turns or 0)
+        _STATS["duration_s"] = round(_STATS.get("duration_s", 0) + (message.duration_ms or 0) / 1000, 1)
+        _STATS["cost_usd"] = round(_STATS.get("cost_usd", 0) + (message.total_cost_usd or 0), 4)
+
+
+def _options_kwargs() -> Dict[str, Any]:
+    return {"max_turns": MAX_TURNS}
+
+
+def _note_usage(message: Any) -> None:
+    usage = getattr(message, "usage", None)
+    if isinstance(usage, dict):
+        for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"):
+            if isinstance(usage.get(key), int):
+                _USAGE[key] = _USAGE.get(key, 0) + usage[key]
+
+
+# Errors that no retry can fix (out of quota, rate limited, not logged in). Retrying only burns
+# calls, so the first one ends the attempts at once.
+_UNRECOVERABLE = ("session limit", "usage limit", "hit your", "rate limit", "credit balance", "quota",
+                  "not logged in", "please run /login", "authentication", "unauthorized", "invalid api key",
+                  "permission denied", "billing")
+
+
+class _Rejected(ValueError):
+    """The answer arrived but failed our own content checks. Always worth another try, whatever
+    words the message contains."""
+
+
+def _unrecoverable(error: Exception) -> bool:
+    if isinstance(error, _Rejected):
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in _UNRECOVERABLE)
 
 
 def _schema_for(required_keys: List[str]) -> Dict[str, Any]:
@@ -76,7 +131,7 @@ async def _call_once(
         model=model or config.MODEL_ID,
         tools=[],
         output_format={"type": "json_schema", "schema": schema},
-        max_turns=MAX_TURNS,
+        **_options_kwargs(),
     )
 
     # Let the async generator run to its own natural end rather than
@@ -88,8 +143,10 @@ async def _call_once(
     # The AI streams back many messages while working; only the final
     # "result" message contains the finished, validated answer.
     async for message in query(prompt=prompt, options=options):
+        _note_stats(message)
         if isinstance(message, ResultMessage):
             structured_output = message.structured_output
+            _note_usage(message)
 
     return structured_output
 
@@ -126,7 +183,14 @@ def call_llm_json(
     # attempts run out.
     last_error: Optional[Exception] = None
     current_prompt = prompt
+    _USAGE.clear()
+    _STATS.clear()
+    attempts_used = 0
+    token_log.record("llm_start", agent_name, system_tokens=token_log.est_tokens(system or ""),
+                     prompt_tokens=token_log.est_tokens(prompt), max_attempts=max_attempts)
     for attempt in range(1, max_attempts + 1):
+        attempts_used = attempt
+        before = dict(_USAGE)
         try:
             # asyncio.run lets this ordinary (non-async) function use the
             # SDK's asynchronous call and wait for its answer.
@@ -147,16 +211,29 @@ def call_llm_json(
                         f"============================================================\n\n"
                         f"{detail}\n\nCorrect exactly this and return the complete JSON again."
                     )
-                    raise ValueError(detail) from None
+                    raise _Rejected(detail) from None
+            token_log.record("llm_attempt", agent_name, attempt=attempt, ok=True,
+                             usage={k: v - before.get(k, 0) for k, v in _USAGE.items()}, stats=dict(_STATS))
+            token_log.record("llm_call", agent_name, ok=True, attempts=attempts_used,
+                             answer_tokens_est=token_log.est_tokens(json.dumps(result, default=str)), stats=dict(_STATS),
+                             system_tokens=token_log.est_tokens(system or ""),
+                             prompt_tokens=token_log.est_tokens(prompt), usage=dict(_USAGE))
             return result
         except Exception as exc:  # noqa: BLE001 -- retried uniformly, re-raised below
             last_error = exc
+            token_log.record("llm_attempt", agent_name, attempt=attempt, ok=False, error=str(exc)[:200],
+                             usage={k: v - before.get(k, 0) for k, v in _USAGE.items()})
+            if _unrecoverable(exc):
+                break                      # no retry can help: stop now instead of paying for more
             if attempt == max_attempts:
                 break
 
     # All attempts failed: report which agent failed and why.
+    token_log.record("llm_call", agent_name, ok=False, attempts=attempts_used, stats=dict(_STATS),
+                     system_tokens=token_log.est_tokens(system or ""),
+                     prompt_tokens=token_log.est_tokens(prompt), usage=dict(_USAGE))
     raise ValueError(
-        f"{agent_name} returned an invalid response after {max_attempts} attempts: {last_error}"
+        f"{agent_name} returned an invalid response after {attempts_used} attempt{'s' if attempts_used != 1 else ''}: {last_error}"
     )
 
 
@@ -167,12 +244,15 @@ async def _call_once_text(prompt: str, system: Optional[str], model: Optional[st
         system_prompt=system,
         model=model or config.MODEL_ID,
         tools=[],
-        max_turns=MAX_TURNS,
+        **_options_kwargs(),
     )
 
     # Collect every piece of text the AI writes and glue them together.
     text_parts: List[str] = []
     async for message in query(prompt=prompt, options=options):
+        _note_stats(message)
+        if isinstance(message, ResultMessage):
+            _note_usage(message)
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock):
@@ -194,7 +274,12 @@ def call_llm_text(
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("LLM prompt cannot be empty.")
 
+    _USAGE.clear()
+    _STATS.clear()
     text = asyncio.run(_call_once_text(prompt, system, model))
+    token_log.record("llm_call", "Discussion", ok=bool(text), attempts=1,
+                     system_tokens=token_log.est_tokens(system or ""), prompt_tokens=token_log.est_tokens(prompt),
+                     usage=dict(_USAGE), stats=dict(_STATS))
     if not text:
         raise ValueError("Claude did not return a text response.")
     return text

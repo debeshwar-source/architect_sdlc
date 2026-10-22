@@ -26,12 +26,12 @@ fi
   --collect-all langgraph --collect-all langgraph_checkpoint --collect-all langchain_core \
   --collect-all docx --collect-all reportlab --collect-all openpyxl \
   --collect-submodules agents --collect-submodules hive --collect-submodules tools \
-  --collect-submodules orchestrator --collect-submodules knowledge_base \
+  --collect-submodules orchestrator --collect-submodules knowledge_base --collect-submodules coding --collect-submodules review --collect-submodules qa \
   --add-data "$PWD/streamlit_app.py:." \
   --add-data "$PWD/.streamlit:.streamlit" \
   --add-data "$PWD/.env.example:." \
   --add-data "$PWD/skills:skills" \
-  --add-data "$PWD/knowledge_base/streamly:knowledge_base/streamly" \
+  --add-data "$PWD/knowledge_base/streamly.md:knowledge_base" \
   desktop.py
 
 APP=dist/Blueprint.app
