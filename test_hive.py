@@ -92,39 +92,37 @@ def test_empty_knowledge_base_is_fine():
 
 
 def test_kb_create_then_augment_never_overwrites():
-    f = Path(tempfile.mkdtemp()) / "new-kb.md"           # the file does not exist yet
-    kb.create_doc("Todo API", "# todo-api\n\n- **Purpose:** keeps todos", f)
-    text = f.read_text()
-    assert "## Applications" in text and "- `todo-api` — keeps todos" in text and "## todo-api" in text
+    d = Path(tempfile.mkdtemp()) / "new-folder"  # folder does not exist yet
+    kb.create_doc("Todo API", "# todo-api\n\n- **Purpose:** keeps todos", d)
+    assert (d / "todo-api.md").is_file()
     # Creating the same one again must refuse, not overwrite.
     try:
-        kb.create_doc("todo-api", "# something else", f)
+        kb.create_doc("todo-api", "# something else", d)
         raise AssertionError("expected FileExistsError")
     except FileExistsError:
         pass
-    kb.augment_doc("todo-api", "- exposes `GET /todos`", run_id="r9", kb_file=f)
-    after = f.read_text()
-    assert after.startswith(text.rstrip())                # original text untouched
-    assert "## Update to todo-api" in after and "run r9" in after and "GET /todos" in after
+    kb.augment_doc("todo-api", "- exposes `GET /todos`", run_id="r9", kb_dir=d)
+    text = (d / "todo-api.md").read_text()
+    assert text.startswith("# todo-api")                 # original text untouched
+    assert "## Update" in text and "run r9" in text and "GET /todos" in text
     # And the loader can read what the agent wrote.
-    docs = kb.load_all(f)
+    docs = kb.load_all(d)
     assert [x.name for x in docs] == ["todo-api"] and docs[0].purpose == "keeps todos"
 
 
-def test_kb_names_cannot_escape_the_file():
-    f = Path(tempfile.mkdtemp()) / "kb.md"
-    kb.create_doc("../../evil", "# x", f)
-    assert [d.name for d in kb.load_all(f)] == ["evil"]   # the name was reduced to a safe one
-    assert sorted(p.name for p in f.parent.iterdir()) == ["kb.md"]
+def test_kb_names_cannot_escape_the_folder():
+    d = Path(tempfile.mkdtemp())
+    path = kb.create_doc("../../evil", "# x", d)
+    assert path.parent == d                               # stayed inside the folder
     try:
-        kb.create_doc("///", "# x", f)
+        kb.create_doc("///", "# x", d)
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
 
 
 def test_apply_updates_is_forgiving_and_isolates_failures():
-    f = Path(tempfile.mkdtemp()) / "kb.md"
+    d = Path(tempfile.mkdtemp())
     results = kb.apply_updates(
         [
             {"application": "a", "action": "create", "content": "# a"},
@@ -133,19 +131,11 @@ def test_apply_updates_is_forgiving_and_isolates_failures():
             {"application": "c", "action": "delete", "content": "x"},       # unknown action
             {"application": "!!!", "action": "create", "content": "# bad"},  # invalid name
         ],
-        run_id="r1", kb_dir=f,
+        run_id="r1", kb_dir=d,
     )
     assert [r["status"] for r in results] == ["applied", "applied", "applied", "skipped", "failed"]
     assert [r["action"] for r in results[:3]] == ["create", "augment", "create"]
-    assert "more" in f.read_text() and [d.name for d in kb.load_all(f)] == ["a", "b"]
-
-
-def test_a_page_with_no_applications_list_is_one_application_and_gaining_one_keeps_it_listed():
-    f = Path(tempfile.mkdtemp()) / "shop.md"
-    f.write_text("# shop\n\nA small shop backend that sells things to people online.\n")
-    assert [d.name for d in kb.load_all(f)] == ["shop"]
-    kb.create_doc("billing", "# billing\n\n- **Purpose:** invoices", f)
-    assert [d.name for d in kb.load_all(f)] == ["shop", "billing"]
+    assert "more" in (d / "a.md").read_text()
 
 
 # ------------------------------------------------------------
@@ -210,32 +200,15 @@ def test_design_kb_updates_are_cleaned():
 # Release agent + Jira hierarchy
 # ------------------------------------------------------------
 
-def _assignment(**over):
-    a = {"agent": "coding_python", "skills": [], "kb_refs": [],
-         "output": {"type": "pull_request", "summary": "Adds the endpoint", "repo": "todo-api",
-                    "branch": "feature/todo-endpoint", "paths": ["src/todo/api.py"],
-                    "done_checks": ["unit tests for the endpoint pass"]}}
-    a.update(over)
-    return a
-
-
 def _story(sid="S1", component="todo-api", **over):
     s = {
         "id": sid, "component": component, "title": f"Story {sid}", "description": "d",
         "acceptance_criteria": ["works"], "blocked_by": [], "team": "", "priority": "High",
         "story_points": 3, "labels": ["new-service"],
-        "tasks": [{"title": "Build it", "description": "", "assignment": _assignment(),
-                   "subtasks": [{"title": "write code"}]}],
+        "tasks": [{"title": "Build it", "description": "", "subtasks": [{"title": "write code"}]}],
     }
     s.update(over)
     return s
-
-
-def _reading(story, *docs):
-    """A story whose first task reads the named knowledge-base documents (needed when the story's
-    application has a document)."""
-    story["tasks"][0]["assignment"]["kb_refs"] = [{"doc": d, "sections": []} for d in docs]
-    return story
 
 
 def _release(stories):
@@ -336,9 +309,9 @@ def _run_new_kb(**state):
 def test_knowledge_bases_can_be_listed_created_and_looked_up():
     with _kb_root() as root:
         assert kb.list_knowledge_bases() == []
-        (root / "__pycache__").mkdir(); (root / ".hidden.md").write_text("x"); (root / "_note.md").write_text("x")
-        path = kb.create_knowledge_base("My New KB!")                    # name is made file-safe
-        assert path == root / "my-new-kb.md" and path.is_file()
+        (root / "__pycache__").mkdir(); (root / ".hidden").mkdir(); (root / "loose.md").write_text("x")
+        path = kb.create_knowledge_base("My New KB!")                    # name is made folder-safe
+        assert path == root / "my-new-kb" and path.is_dir()
         kb.create_doc("a", "# a", path)
         assert [(k.name, k.application_count) for k in kb.list_knowledge_bases()] == [("my-new-kb", 1)]
         assert kb.kb_path("my-new-kb") == path
@@ -369,8 +342,8 @@ def test_new_knowledge_base_is_only_created_if_the_user_says_yes():
         final = _run_new_kb(kb_confirm=lambda p: asked.append(p) or "todo-kb")
         assert final["kb_result"]["status"] == "saved" and final["kb_result"]["created_new_kb"]
         assert [k.name for k in kb.list_knowledge_bases()] == ["todo-kb"]
-        assert (root / "todo-kb.md").is_file()
-        assert [d.name for d in kb.load_all(root / "todo-kb.md")] == ["todo-api"]    # loadable next time
+        assert (root / "todo-kb" / "todo-api.md").is_file()
+        assert [d.name for d in kb.load_all(root / "todo-kb")] == ["todo-api"]       # loadable next time
         # What the user was shown: a NEW knowledge base, a suggested name, the documents.
         p = asked[0]
         assert p["mode"] == "new" and p["suggested_name"] == "todo-app" and p["updates"][0]["application"] == "todo-api"
@@ -380,10 +353,9 @@ def test_new_knowledge_base_name_cannot_collide_with_an_existing_one():
     with _kb_root() as root:
         existing = kb.create_knowledge_base("todo-kb")
         kb.create_doc("keep-me", "# keep-me", existing)
-        before = existing.read_text()
         final = _run_new_kb(kb_confirm=lambda p: "todo-kb")
         assert final["kb_result"]["status"] == "failed" and "already exists" in final["kb_result"]["error"]
-        assert existing.read_text() == before                                        # untouched
+        assert [p.name for p in existing.iterdir()] == ["keep-me.md"]               # untouched
         assert final["run_outcome"] == "APPROVED_RELEASED"                          # the run itself survives
 
 
@@ -400,7 +372,7 @@ def test_selected_knowledge_base_is_only_changed_after_approval():
     with _kb_root() as root:
         folder = kb.create_knowledge_base("platform")
         kb.create_doc("user-service", "# user-service\n\n- **Purpose:** keeps users", folder)
-        before = folder.read_text()
+        before = (folder / "user-service.md").read_text()
         docs = kb.load_all(folder)
 
         canned = _scratch_canned("extend_existing")
@@ -412,24 +384,23 @@ def test_selected_knowledge_base_is_only_changed_after_approval():
                 {"application": "user-service", "action": "augment", "content": "- stores reminder prefs", "reason": "r"},
                 {"application": "reminder-service", "action": "create", "content": "# reminder-service", "reason": "r"},
             ])
-        canned["Release Agent"]["stories"] = [_reading(_story("S1", component="user-service"), "user-service"),
+        canned["Release Agent"]["stories"] = [_story("S1", component="user-service"),
                                               _story("S2", component="reminder-service", blocked_by=["S1"])]
 
         def run(**state):
             return _run_pipeline(docs, "Add reminders", canned, kb_name="platform", **state)[0]
 
         final = run()                                                    # nobody answered
-        assert final["kb_result"]["status"] == "declined" and folder.read_text() == before
-        assert "reminder-service" not in folder.read_text()
+        assert final["kb_result"]["status"] == "declined" and (folder / "user-service.md").read_text() == before
+        assert not (folder / "reminder-service.md").exists()
 
         asked = []
         final = run(kb_confirm=lambda p: asked.append(p) or True)
         assert asked[0]["mode"] == "existing" and asked[0]["kb_name"] == "platform"
         assert final["kb_result"]["status"] == "saved" and not final["kb_result"]["created_new_kb"]
-        text = folder.read_text()
-        assert all(line in text for line in before.splitlines() if line.strip())      # nothing rewritten or removed
-        assert "stores reminder prefs" in text
-        assert [d.name for d in kb.load_all(folder)] == ["user-service", "reminder-service"]
+        text = (folder / "user-service.md").read_text()
+        assert text.startswith(before.rstrip()) and "stores reminder prefs" in text  # appended, not rewritten
+        assert (folder / "reminder-service.md").is_file()
         assert [k.name for k in kb.list_knowledge_bases()] == ["platform"]           # no extra knowledge base
 
 
@@ -474,7 +445,7 @@ SECRET = "ZZ-EXISTING-SYSTEM-MARKER"
 
 def _existing_kb():
     # An "old" knowledge base with one distinctive document.
-    d = Path(tempfile.mkdtemp()) / "old-kb.md"
+    d = Path(tempfile.mkdtemp())
     kb.create_doc("user-service", f"# user-service\n\n- **Purpose:** {SECRET} keeps user profiles", d)
     return d, kb.load_all(d)
 
@@ -571,7 +542,7 @@ def test_design_in_scratch_mode_rejects_existing_applications():
 
 def test_scratch_knowledge_base_writes_never_touch_existing_documents():
     d, _ = _existing_kb()
-    before = d.read_text()
+    before = (d / "user-service.md").read_text()
     results = kb.apply_updates(
         [
             {"application": "user-service", "action": "create", "content": "- scratch design"},
@@ -581,9 +552,8 @@ def test_scratch_knowledge_base_writes_never_touch_existing_documents():
         run_id="r1", kb_dir=d, create_only=True,
     )
     assert [r["status"] for r in results] == ["skipped", "skipped", "applied"]
-    assert all(line in d.read_text() for line in before.splitlines() if line.strip())   # existing text untouched
-    assert "scratch design" not in d.read_text()                  # nothing was appended to the old application
-    assert [x.name for x in kb.load_all(d)] == ["user-service", "todo-api"]       # the new one was created
+    assert (d / "user-service.md").read_text() == before          # untouched
+    assert (d / "todo-api.md").is_file()                          # new one created
 
 
 def test_requirement_build_mode_is_validated_and_user_choice_wins():
@@ -799,8 +769,8 @@ def test_jira_project_key_mistakes_get_plain_explanations():
 def _two_task_story(sid="S1"):
     story = _story(sid)
     story["tasks"] = [
-        {"title": "First task", "description": "", "assignment": _assignment(), "subtasks": [{"title": "a"}]},
-        {"title": "Second task", "description": "", "assignment": _assignment(), "subtasks": [{"title": "b"}]},
+        {"title": "First task", "description": "", "subtasks": [{"title": "a"}]},
+        {"title": "Second task", "description": "", "subtasks": [{"title": "b"}]},
     ]
     return story
 
@@ -1027,8 +997,7 @@ def test_run_can_stop_after_the_design_agent_and_still_offers_the_knowledge_base
         asked = []
         final, log = _run_pipeline([], "Build a todo app", _new_kb_canned(), force_from_scratch=True,
                                    stop_after="design", kb_confirm=lambda p: asked.append(p) or "design-only-kb")
-        # no Release agent and no Jira
-        assert _agents(log) == {"Requirement Agent", "Design Agent"}
+        assert _agents(log) == {"Requirement Agent", "Design Agent"}          # no Release agent, no Jira
         assert final["run_outcome"] == "DESIGN_ONLY"
         assert not final.get("release_plan") and not final.get("release_result") and not final.get("jira_result")
         assert len(asked) == 1 and final["kb_result"]["status"] == "saved"        # the design's documents can still be saved

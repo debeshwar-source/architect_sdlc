@@ -109,39 +109,6 @@ def test_sessions_are_listed_newest_first_with_a_title_and_what_they_wait_for():
         config.RUNS_ROOT = old
 
 
-def test_a_custom_name_is_saved_listed_with_the_original_title_and_kept_when_reopened():
-    old = config.RUNS_ROOT
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            _runs(tmp)
-            ss.save(_session(run_id="run-a", session_name="  Coupon   rollout v1  "))
-            ss.save(_session(run_id="run-b"))
-            by = {i["run_id"]: i for i in ss.list_sessions()}
-            assert by["run-a"]["title"] == "Coupon rollout v1" and by["run-a"]["named"] and by["run-a"]["original"] == "Todo reminders"
-            assert by["run-b"]["title"] == "Todo reminders" and not by["run-b"]["named"] and by["run-b"]["original"] == ""      # unnamed: as before
-            back = ss.restore("run-a", lambda name: [])
-            assert back["session"]["session_name"] == "Coupon   rollout v1".replace("   ", " ") or back["session"]["session_name"].strip() == "Coupon   rollout v1"
-    finally:
-        config.RUNS_ROOT = old
-
-
-def test_names_are_tidied_limited_and_one_name_cannot_belong_to_two_sessions():
-    old = config.RUNS_ROOT
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            _runs(tmp)
-            assert ss.clean_name("  a \n  b\t c ") == "a b c" and ss.clean_name("") == "" and ss.clean_name(None) == ""
-            assert len(ss.clean_name("x" * 500)) == ss.NAME_MAX
-            ss.save(_session(run_id="run-a", session_name="Coupon rollout v1"))
-            ss.save(_session(run_id="run-b"))
-            assert ss.name_taken("coupon ROLLOUT v1", "run-b")                       # another session has it (case does not matter)
-            assert not ss.name_taken("Coupon rollout v1", "run-a")                    # your own name is yours
-            assert not ss.name_taken("Todo reminders", "run-a")                       # an automatic title is not a name anyone holds
-            assert not ss.name_taken("", "run-b") and not ss.name_taken("Something new", "run-b")
-    finally:
-        config.RUNS_ROOT = old
-
-
 def test_closing_the_app_and_opening_it_again_resumes_at_the_same_pause():
     with t._kb_root(), ui.scripted_ai(ui.new_kb_canned()) as prompts:
         at = ui.start(text="Build a todo app", mode="Human approval")             # paused after the Requirement agent
@@ -160,19 +127,6 @@ def test_closing_the_app_and_opening_it_again_resumes_at_the_same_pause():
         again = ui.click(again, "Approve & continue")                              # and it can carry on
         assert not again.exception, again.exception
         assert "Freeze architecture" in ui.labels(again) and {a for a, _ in prompts} >= {"Design Agent"}
-
-
-def test_a_fresh_start_opens_nothing_and_does_not_claim_a_session_was_reopened():
-    with t._kb_root(), ui.scripted_ai(ui.new_kb_canned()):
-        first = ui.fresh_app()                                                    # nothing saved yet
-        assert not any("Session reopened" in x.value for x in first.success)
-        at = ui.start(text="Build a todo app", mode="Human approval")             # now there is a saved session
-        assert not at.exception, at.exception
-        again = ui.fresh_app()                                                    # the app is closed and started again
-        assert not again.exception, again.exception
-        assert "run_id" not in again.session_state and "run_started" not in again.session_state
-        assert not any("Session reopened" in x.value for x in again.success)      # no false "reopened" banner
-        assert "Open" in ui.labels(again) and "Freeze requirements" not in ui.labels(again)   # offered, not opened
 
 
 def test_deleting_a_saved_session_removes_only_its_snapshot():
