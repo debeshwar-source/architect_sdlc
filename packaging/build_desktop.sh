@@ -31,7 +31,7 @@ fi
   --add-data "$PWD/.streamlit:.streamlit" \
   --add-data "$PWD/.env.example:." \
   --add-data "$PWD/skills:skills" \
-  --add-data "$PWD/knowledge_base/streamly.md:knowledge_base" \
+  --add-data "$PWD/knowledge_base/d2c_user.md:knowledge_base" \
   desktop.py
 
 APP=dist/Blueprint.app
