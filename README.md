@@ -108,11 +108,15 @@ build-order diagram, plus tables for components, interfaces, a who-talks-to-whom
 
 ## Knowledge bases
 
-A **knowledge base** is a folder of documents, one per application, that the
-agents read to understand an existing system. Each sub-folder of
-`knowledge_base/` is one knowledge base (the demo one is
-`knowledge_base/streamly/`), so you can keep several -- one per system or
-project. They are optional.
+A **knowledge base** is ONE markdown page that the agents read to understand an
+existing system. Each `.md` file in `knowledge_base/` is one knowledge base, named
+after it (the demo one is `knowledge_base/streamly.md`), so you can keep several --
+one per system or project. They are optional.
+
+The page is written for the agents: crisp, with every detail that matters. If it has
+an `## Applications` section whose bullets look like ``- `name` — what it does``, each
+bullet is one application (the app uses the names to check a design); otherwise the
+whole page is one application named after the file.
 
 **Choosing one** -- when you start a run you pick either:
 
@@ -393,7 +397,7 @@ Run outcomes: `RELEASED_TO_JIRA`, `JIRA_FAILED`, `APPROVED_RELEASED` (local only
 
 ## Demo data
 
-`knowledge_base/streamly/*.md` describes **fictional**
+`knowledge_base/streamly.md` describes **fictional**
 microservices forming a small, coherent OTT streaming platform
 ("Streamly") -- written for this demo, not pulled from any real system.
 
@@ -421,9 +425,14 @@ agents/requirement.py           stage 1
 agents/design.py                stage 2 (formerly "architecture")
 agents/release.py               stage 3 -- Jira epic/stories/tasks/subtasks
 agents/discuss.py               chat helper for the UI's approval gates
-skills/*.md                     one system prompt per agent
+skills/<name>.md                one md file per skill (crisp, all the detail)
+token_log.py                    runs/token_log.jsonl: prompt sizes, attempts, usage
+token_report.py                 per-agent token report from the ledger (answer vs hidden output, cache hits)
+replay.py                       re-runs one stage of a saved run and compares answer + tokens (uses real tokens)
+agents/catalog.py               the agents a task can be assigned to, output types, assignment checks
+agents/escalation.py            bounce limits for agent -> manager -> user questions (limits in config.py)
 knowledge_base/loader.py        lists, reads, creates and appends to knowledge bases
-knowledge_base/<name>/            one folder per knowledge base (demo: streamly/)
+knowledge_base/<name>.md          one md page per knowledge base (demo: streamly.md)
 hive/                           events, blackboard, cross-run memory
 tools/issue_tracker.py          local mock Jira
 tools/requirement_doc.py        the requirement as a document: screen, Word, PDF
@@ -436,3 +445,50 @@ run_desktop.sh                  one command: sets up and runs the desktop app
 requirements-desktop.txt        extra package for the desktop window (pywebview)
 requirements-build.txt          adds PyInstaller, only needed to build the app
 ```
+
+## Coding agent (pull requests)
+
+Found under the release plan of any session (also reopened ones), or on its own: `streamlit run coding_app.py`.
+Pick a task from the first Engineering Manager's plan, a GitHub address or local folder, and a default expert. Then:
+
+1. **Engineering Manager 2** explores the repository the way Claude Code does -- searching and opening files as the task
+   needs them, not the whole repository -- and breaks the task into subtasks. Each has exact instructions, the files to
+   change, the context the coder would otherwise have to read, the tests to run, and its own expert agent (changeable).
+   It describes the work and does not write the code (a manager that pastes code is sent back once to describe it instead;
+   the coding agent writes the code, and you review it as a diff). It asks you if it is in real doubt. You can **reconsider** with your comments as often as you like, then **freeze**.
+   **Memory:** when you freeze, the durable things it learned about the repository (build/test commands, conventions, where
+   examples live) are saved to `runs/coding/memory/<repository>.json` and given to the next job on that repository, so it
+   explores less. Each fact records the commit and files it rests on; if those files changed since, it is marked CHECK and
+   re-verified. Only frozen (approved) work is remembered. The memory is shown, and can be cleared, in the "🧠 What
+   Engineering Manager 2 remembers" panel.
+2. **Jira** -- only after you freeze, it asks whether to write the subtasks into the task's Jira ticket (its "Steps" list,
+   with the expert of each, plus a label per expert). Jira does not allow a Sub-task to have Sub-tasks, and the first
+   manager already publishes each task as a Sub-task, so the finer subtasks live in that ticket. Say no and Jira is untouched.
+3. **Steps** -- each subtask is a fixed procedure, enforced by code rather than left to the AI's habits: the coder
+   (which has **no shell**) reads only the files the subtask names, **writes the code and its unit tests**; then the code
+   **runs the tests** with the one command Engineering Manager 2 proposed (you can change it before freezing) and reports
+   *Total / Passed / Failed*; failing tests go back to the coder to fix, up to three times; whatever is still failing is
+   reported with its reason. A build that cannot run here (no network for dependencies) is reported as "did not run", not
+   debugged. You then see the side-by-side diff with the test panel and decide: **approve the changes** (or **reconsider
+   with your input**, or **skip**), then **commit** (editable message; on this computer only). If a step cannot be done
+   until something else is done, the agent says so (**blocked**) with the reason; you can have it written on the Jira
+   ticket, then retry once it is unblocked.
+4. **Push and pull request** -- when every subtask is committed: the commits and the whole diff, then **push the branch**
+   (optionally squashed first; never forced), then, as a separate approval, **open the pull request**.
+5. **Jira follow-up, each with your permission** -- once the PR is open: the ticket gets the PR link and moves to an
+   in-between status (such as In Review), **not Done**, and a comment gets the unit-test results (also in the PR description). When the PR is merged (checked on GitHub when the job is opened
+   and on request; needs `GITHUB_TOKEN`), you are asked whether to move the ticket to **Done**.
+
+**Task board.** The top of the section lists every task with its state (not started, planning, ready, in progress n of m,
+blocked, pushed, PR open, merged) and its subtasks; open any to continue its job. It is built from the saved jobs, so it
+is the same when a session is reopened.
+
+Optional Jira settings (ids of custom fields, from a Jira admin): `JIRA_PR_LINK_FIELD` (where the PR link goes; otherwise it
+is attached as a web link) and `JIRA_BLOCKED_REASON_FIELD` (where the blocked reason goes; otherwise a comment).
+
+Alternatively choose "the first manager's subtasks, as they are": they become the steps with no exploring.
+
+Any agent asks you whenever it is in real doubt. The agents work on their own branch in a separate git worktree (your folder
+is never edited), cannot commit or push themselves, and nothing leaves your computer until the last button (and the Jira
+step, if you allow it). Jobs are saved to `runs/coding/jobs/`, so a closed app can continue them ("continue a saved job").
+Set `GITHUB_TOKEN` (or `GH_TOKEN`) to open the PR automatically; without it you get GitHub's one-click "compare" link.

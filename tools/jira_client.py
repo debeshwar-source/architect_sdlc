@@ -63,6 +63,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
+from agents import catalog
+
 # The REST API version used. v2 takes plain text / wiki-markup descriptions,
 # which is simpler than v3's document format and works on Cloud and Data Center.
 API = "/rest/api/2"
@@ -181,6 +183,20 @@ def _summary(text: str) -> str:
 
 def _bullets(items: List[str]) -> str:
     return "\n".join(f"* {i}" for i in items)
+
+
+_STEPS_SECTION = re.compile(r"h3\. Steps\n(?:[*#].*(?:\n|$))*")
+
+
+def replace_steps(description: str, steps_markup: str) -> str:
+    """The Jira description with its 'h3. Steps' section swapped for `steps_markup` (which starts with that heading).
+    No such section yet: it goes before the Assignment section, or at the end."""
+    if _STEPS_SECTION.search(description):
+        return _STEPS_SECTION.sub(lambda _m: steps_markup + "\n", description, count=1).rstrip() + ("\n" if description.endswith("\n") else "")
+    marker = description.find("h3. Assignment")
+    if marker >= 0:
+        return description[:marker].rstrip() + "\n\n" + steps_markup + "\n\n" + description[marker:]
+    return (description.rstrip() + "\n\n" if description.strip() else "") + steps_markup
 
 
 def _fingerprint(epic: dict, stories: List[dict], project_key: str) -> str:
@@ -438,7 +454,10 @@ class JiraClient:
                     if tkey not in todo:
                         continue
                     steps = [s["title"] + (f": {s['description']}" if s.get("description") else "") for s in task["subtasks"]]
-                    description = (task.get("description") or "") + (f"\n\nh3. Steps\n{_bullets(steps)}" if steps else "") + footer
+                    who = catalog.assignment_lines(task.get("assignment") or {})
+                    description = ((task.get("description") or "")
+                                   + (f"\n\nh3. Steps\n{_bullets(steps)}" if steps else "")
+                                   + (f"\n\nh3. Assignment\n{_bullets(who)}" if who else "") + footer)
                     fields = self._common("sub", task["title"], description.strip(), [run_label])
                     fields["parent"] = {"key": story_key}
                     created[tkey] = self._create(fields, {"labels"})
@@ -472,6 +491,36 @@ class JiraClient:
 
         save()
         return self._result(epic, stories, created, resumed=resumed)
+
+    def update_task_steps(self, issue_key: str, steps_markup: str, labels: List[str]) -> None:
+        """Rewrite the 'Steps' section of an existing Jira issue (one of our tasks) and add labels. Everything else in
+        the description is kept. (Jira does not allow a Sub-task to have Sub-tasks, so the finer steps live here.)"""
+        resp = self._send("GET", f"/issue/{issue_key}?fields=description")
+        current = (resp.json().get("fields") or {}).get("description") or ""
+        body: dict = {"fields": {"description": replace_steps(current, steps_markup)}}
+        if labels:
+            body["update"] = {"labels": [{"add": _label(l)} for l in labels]}
+        self._send("PUT", f"/issue/{issue_key}", body)
+
+    # ---- small edits to an existing issue (used when a coding task moves on) ----
+
+    def get_transitions(self, issue_key: str) -> List[dict]:
+        """The moves the issue can make now: [{'id', 'name', 'to': status name, 'category': new|indeterminate|done}]."""
+        data = self._send("GET", f"/issue/{issue_key}/transitions").json()
+        return [{"id": t["id"], "name": t.get("name", ""), "to": (t.get("to") or {}).get("name", ""),
+                 "category": ((t.get("to") or {}).get("statusCategory") or {}).get("key", "")} for t in data.get("transitions", [])]
+
+    def transition(self, issue_key: str, transition_id: str) -> None:
+        self._send("POST", f"/issue/{issue_key}/transitions", {"transition": {"id": transition_id}})
+
+    def set_field(self, issue_key: str, field_id: str, value: Any) -> None:
+        self._send("PUT", f"/issue/{issue_key}", {"fields": {field_id: value}})
+
+    def add_remote_link(self, issue_key: str, url: str, title: str) -> None:
+        self._send("POST", f"/issue/{issue_key}/remotelink", {"object": {"url": url, "title": title}})
+
+    def add_comment(self, issue_key: str, text: str) -> None:
+        self._send("POST", f"/issue/{issue_key}/comment", {"body": text})
 
     def _create_story(self, story: dict, epic_key: Optional[str], run_label: str, footer: str) -> str:
         parts = [story.get("description") or ""]

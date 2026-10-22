@@ -93,6 +93,12 @@ ROOT = Path(__file__).resolve().parent
 KNOWLEDGE_BASES_ROOT = Path(
     os.environ.get("CLAUDE_SDLC_ARCHITECT_KB_ROOT", str(ROOT / "knowledge_base"))
 )
+# Escalation limits (agents/escalation.py): when an agent is unsure it asks the Engineering Manager,
+# and the manager asks the user only if it cannot decide. Hard caps, so questions can never loop.
+ESC_BOUNCES_PER_TASK = int(os.environ.get("CLAUDE_SDLC_ARCHITECT_ESC_BOUNCES_PER_TASK", "2"))
+ESC_REASSIGNS_PER_TASK = int(os.environ.get("CLAUDE_SDLC_ARCHITECT_ESC_REASSIGNS_PER_TASK", "1"))
+ESC_USER_QUESTIONS_PER_RELEASE = int(os.environ.get("CLAUDE_SDLC_ARCHITECT_ESC_USER_QUESTIONS", "3"))
+ESC_EXTRA_CALLS_PER_RELEASE = int(os.environ.get("CLAUDE_SDLC_ARCHITECT_ESC_EXTRA_CALLS", "12"))
 # Where each agent's instruction sheet ("skill", i.e. its system prompt) lives.
 SKILLS_DIR = ROOT / "skills"
 # Where every run's output files (logs, results, mock tickets) are saved.

@@ -16,14 +16,11 @@ import config
 
 @lru_cache(maxsize=None)
 def load_skill(name: str) -> str:
-    """Read a skill file once per process; skills are static within a
-    run. name is the skill's filename without extension, e.g.
-    'architecture' for skills/architecture.md."""
-    # @lru_cache (above) remembers the result, so the file is read from
-    # disk only the first time.
+    """Read a skill once per process; skills are static within a run. A skill is ONE markdown file named
+    after it, e.g. 'design' for skills/design.md."""
     path = config.SKILLS_DIR / f"{name}.md"
     if not path.is_file():
-        raise FileNotFoundError(f"Skill file not found: {path}")
+        raise FileNotFoundError(f"Skill not found: {path}")
     return path.read_text(encoding="utf-8")
 
 

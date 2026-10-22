@@ -332,7 +332,7 @@ def self_test(with_ai: bool = False) -> int:
     def pipeline_imports():
         # Importing these also tells the packager which modules to include.
         import agents.design, agents.quality, agents.release, agents.requirement, agents.discuss  # noqa: F401
-        import config, llm, run_log                                                   # noqa: F401
+        import config, llm, run_log, ui_kit                                                 # noqa: F401
         import hive.blackboard, hive.events, hive.memory                              # noqa: F401
         import knowledge_base.loader, orchestrator.graph                              # noqa: F401
         import tools.issue_tracker, tools.jira_client, tools.requirement_doc          # noqa: F401
